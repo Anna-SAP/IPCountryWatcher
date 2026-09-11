@@ -1,0 +1,126 @@
+﻿name: Build and release Windows installer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'tests/**'
+      - 'installer/**'
+      - 'build.ps1'
+      - '*.csproj'
+      - 'app.config'
+      - 'app.manifest'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'tests/**'
+      - 'installer/**'
+      - 'build.ps1'
+      - '*.csproj'
+      - 'app.config'
+      - 'app.manifest'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Only the newest pending update on a branch is needed.
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set build version
+        id: version
+        run: |
+          $version = "1.0.$env:GITHUB_RUN_NUMBER"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Compile, test and create installer
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ./build.ps1 -Test -Installer -Version $env:BUILD_VERSION
+
+      - name: Verify silent install and uninstall
+        run: |
+          ./tests/InstallerSmoke.ps1
+
+      - name: Upload diagnostic results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-results-${{ github.run_number }}
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload installation packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: IPCountryWatcher-${{ steps.version.outputs.version }}
+          path: |
+            dist/IPCountryWatcher-Setup.exe
+            dist/IPCountryWatcher-portable.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: IPCountryWatcher-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_VERSION: ${{ needs.build.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check SHA256SUMS.txt
+          tag="v${BUILD_VERSION}-run${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf '%s\n\n' \
+            "Windows installer and portable build from main." \
+            "Version: ${BUILD_VERSION}" \
+            "Commit: ${COMMIT_SHA}" \
+            "Checks: offline application tests and silent install/uninstall." \
+            "Download IPCountryWatcher-Setup.exe to install, or the portable ZIP." > release-notes.md
+          gh release create "$tag" \
+            IPCountryWatcher-Setup.exe IPCountryWatcher-portable.zip SHA256SUMS.txt \
+            --target "$COMMIT_SHA" \
+            --title "IPCountryWatcher ${BUILD_VERSION}" \
+            --notes-file release-notes.md \
+            --latest
