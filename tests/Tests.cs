@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
 using System.Reflection;
@@ -15,7 +16,7 @@ namespace IPCountryWatcher
         public readonly List<string> Calls = new List<string>();
         public Func<string, CancellationToken, Task<string>> Handler;
         public Task<string> GetAsync(string url, bool proxy, CancellationToken token)
-        { Calls.Add(url); return Handler(url, token); }
+        { lock (Calls) Calls.Add(url); return Handler(url, token); }
     }
 
     internal sealed class SmokeLookup : ILookup
@@ -35,6 +36,16 @@ namespace IPCountryWatcher
         }
     }
 
+    internal sealed class RetryLookup : ILookup
+    {
+        public int Calls;
+        public Task<Snapshot> QueryAsync(bool proxy, CancellationToken token)
+        {
+            int call = Interlocked.Increment(ref Calls);
+            return Task.FromResult(new Snapshot { Ip = "8.8.8.8", CountryCode = call > 1 ? "US" : null,
+                Country = call > 1 ? "美国" : null, CheckedUtc = DateTime.UtcNow });
+        }
+    }
     internal static class Tests
     {
         private static readonly List<string> report = new List<string>();
@@ -59,8 +70,11 @@ namespace IPCountryWatcher
             try
             {
                 CoreTests().GetAwaiter().GetResult();
+                LatencyTests().GetAwaiter().GetResult();
                 IconTests();
                 SmokeTest();
+                TrayLatencyTest();
+                TrayRetryTest();
             }
             catch (Exception ex) { Check("Unhandled exception: " + ex, false); }
             Directory.CreateDirectory("test-results");
@@ -112,9 +126,9 @@ namespace IPCountryWatcher
             await service.QueryAsync(true, CancellationToken.None);
             Check("Geo failure cooldown avoids repeated calls", geoCalls == 3);
             failGeo = false;
-            now = now.AddMinutes(6);
+            now = now.AddSeconds(5);
             Snapshot recovered = await service.QueryAsync(true, CancellationToken.None);
-            Check("Geo failure retries even with unchanged IP", recovered.CountryCode == "JP" && geoCalls == 4);
+            Check("Geo failure recovers after 5 seconds with unchanged IP", recovered.CountryCode == "JP" && geoCalls == 4);
 
             transport = new FakeTransport();
             transport.Handler = (url, token) =>
@@ -174,6 +188,155 @@ namespace IPCountryWatcher
             Check("Normal completion schedules polling", schedule.DueUtc == now.AddSeconds(5));
         }
 
+        private static string BackupGeo(string ip, string code)
+        { return "{\"ip\":\"" + ip + "\",\"country_code\":\"" + code + "\",\"country_name\":\"Test\"}"; }
+
+        private static async Task LatencyTests()
+        {
+            Check("Backup provider parses country", Validation.CountryJson(BackupGeo("8.8.8.8", "US"), "8.8.8.8", true).CountryCode == "US");
+            Reject("Backup rejects mismatched IP", () => Validation.CountryJson(BackupGeo("1.1.1.1", "AU"), "8.8.8.8", true));
+            Reject("Backup rejects error response", () => Validation.CountryJson("{\"error\":true}", "8.8.8.8", true));
+            Reject("Backup rejects invalid country", () => Validation.CountryJson(BackupGeo("8.8.8.8", "../"), "8.8.8.8", true));
+
+            var transport = new FakeTransport();
+            var slowIp = new TaskCompletionSource<string>();
+            var slowGeo = new TaskCompletionSource<string>();
+            int canceledLosers = 0;
+            transport.Handler = (url, token) =>
+            {
+                if (url == LookupService.IpUrls[0] || url.StartsWith("https://ipwho.is/"))
+                {
+                    token.Register(() => Interlocked.Increment(ref canceledLosers));
+                    return url == LookupService.IpUrls[0] ? slowIp.Task : slowGeo.Task;
+                }
+                if (url.StartsWith("https://ipapi.co/")) return Task.FromResult(BackupGeo("8.8.8.8", "US"));
+                return Task.FromResult("8.8.8.8");
+            };
+            var service = new LookupService(transport, () => DateTime.UtcNow);
+            var watch = Stopwatch.StartNew();
+            Snapshot result = await service.QueryAsync(true, CancellationToken.None);
+            Check("Slow IP and geo primaries bypassed in " + watch.ElapsedMilliseconds + " ms",
+                result.CountryCode == "US" && result.Source == "checkip.amazonaws.com" && watch.ElapsedMilliseconds < 1500);
+            Check("Losing requests canceled without waiting for completion", canceledLosers == 2 && !slowIp.Task.IsCompleted && !slowGeo.Task.IsCompleted);
+            Check("Healthy IPv4 avoids IPv6 fallback", !transport.Calls.Contains(LookupService.IpUrls[2]));
+            slowIp.SetResult("1.1.1.1");
+            slowGeo.SetResult(Geo("8.8.8.8", "JP"));
+            await Task.Delay(50);
+            int callsBefore = transport.Calls.Count;
+            transport.Handler = (url, token) => Task.FromResult("8.8.8.8");
+            watch.Restart();
+            result = await service.QueryAsync(true, CancellationToken.None);
+            Check("Late loser cannot poison cache; cached flag in " + watch.ElapsedMilliseconds + " ms",
+                result.CountryCode == "US" && transport.Calls.Count == callsBefore + 1 && watch.ElapsedMilliseconds < 500);
+
+            transport = new FakeTransport();
+            int limited = 0;
+            transport.Handler = (url, token) =>
+            {
+                if (url.StartsWith("https://ipwho.is/"))
+                { Interlocked.Increment(ref limited); throw new RateLimitException(TimeSpan.FromHours(2)); }
+                if (url.StartsWith("https://ipapi.co/")) return Task.FromResult(BackupGeo("8.8.8.8", "US"));
+                return Task.FromResult("8.8.8.8");
+            };
+            service = new LookupService(transport, () => DateTime.UtcNow);
+            result = await service.QueryAsync(true, CancellationToken.None);
+            Check("Primary rate limit does not block backup country", result.CountryCode == "US" && limited == 1);
+
+            transport = new FakeTransport();
+            transport.Handler = (url, token) =>
+            {
+                if (url.StartsWith("https://ipwho.is/")) return Task.FromResult(Geo("1.1.1.1", "AU"));
+                if (url.StartsWith("https://ipapi.co/")) return Task.FromResult(BackupGeo("8.8.8.8", "US"));
+                return Task.FromResult("8.8.8.8");
+            };
+            result = await new LookupService(transport, () => DateTime.UtcNow).QueryAsync(false, CancellationToken.None);
+            Check("Invalid primary response cannot win country race", result.CountryCode == "US" && result.Ip == "8.8.8.8");
+
+            var stuck = new TaskCompletionSource<string>();
+            transport = new FakeTransport();
+            transport.Handler = (url, token) => stuck.Task;
+            using (var cts = new CancellationTokenSource())
+            {
+                service = new LookupService(transport, () => DateTime.UtcNow);
+                watch.Restart();
+                Task<Snapshot> query = service.QueryAsync(true, cts.Token);
+                cts.CancelAfter(50);
+                try { await query; Check("Cancellation interrupts uncooperative transport", false); }
+                catch (OperationCanceledException) { Check("Cancellation interrupts uncooperative transport", watch.ElapsedMilliseconds < 500); }
+            }
+            stuck.SetException(new HttpRequestException("late losing failure"));
+
+            var deadlineIp = new TaskCompletionSource<string>();
+            transport = new FakeTransport();
+            transport.Handler = (url, token) =>
+            {
+                if (url == LookupService.IpUrls[0] || url == LookupService.IpUrls[1]) return deadlineIp.Task;
+                if (url.StartsWith("https://ipwho.is/")) return Task.FromResult(Geo("2606:4700:4700::1111", "AU"));
+                return Task.FromResult("2606:4700:4700::1111");
+            };
+            watch.Restart();
+            result = await new LookupService(transport, () => DateTime.UtcNow).QueryAsync(false, CancellationToken.None);
+            Check("Stage deadline bounds uncooperative IPv4 and enables IPv6 in " + watch.ElapsedMilliseconds + " ms",
+                result.HasCountry && result.Ip == "2606:4700:4700::1111" && watch.ElapsedMilliseconds < 5500);
+            deadlineIp.SetResult("8.8.8.8");
+        }
+
+        private static void TrayLatencyTest()
+        {
+            var slow = new TaskCompletionSource<string>();
+            var watch = Stopwatch.StartNew();
+            long responseMs = -1;
+            var transport = new FakeTransport();
+            transport.Handler = (url, token) =>
+            {
+                if (url.StartsWith("https://ipwho.is/")) return slow.Task;
+                if (url.StartsWith("https://ipapi.co/"))
+                {
+                    Interlocked.Exchange(ref responseMs, watch.ElapsedMilliseconds);
+                    return Task.FromResult(BackupGeo("8.8.8.8", "US"));
+                }
+                return Task.FromResult("8.8.8.8");
+            };
+            var context = new TrayContext(new LookupService(transport, () => DateTime.UtcNow),
+                new Settings { PollSeconds = 60, NotifyOnChange = false }, true);
+            long visibleMs = -1;
+            using (var timer = new System.Windows.Forms.Timer { Interval = 15 })
+            {
+                timer.Tick += (sender, args) =>
+                {
+                    if (context.VisibleCountry == "US") visibleMs = watch.ElapsedMilliseconds;
+                    if (visibleMs >= 0 || watch.ElapsedMilliseconds > 2500) { timer.Stop(); context.ExitThread(); }
+                };
+                timer.Start();
+                Application.Run(context);
+            }
+            context.Dispose();
+            slow.SetResult(Geo("8.8.8.8", "JP"));
+            Check("Real tray shows backup flag in " + visibleMs + " ms despite stuck primary", visibleMs >= 0 && visibleMs < 1500);
+            Check("Country response to visible tray takes " + (visibleMs - responseMs) + " ms", responseMs >= 0 && visibleMs >= responseMs && visibleMs - responseMs < 250);
+        }
+        private static void TrayRetryTest()
+        {
+            var lookup = new RetryLookup();
+            var watch = Stopwatch.StartNew();
+            var context = new TrayContext(lookup, new Settings { PollSeconds = 60, NotifyOnChange = false }, true);
+            bool sawUnknown = false;
+            long recoveredMs = -1;
+            using (var timer = new System.Windows.Forms.Timer { Interval = 25 })
+            {
+                timer.Tick += (sender, args) =>
+                {
+                    if (context.Current != null && context.Current.HasIp && !context.Current.HasCountry) sawUnknown = true;
+                    if (context.VisibleCountry == "US") recoveredMs = watch.ElapsedMilliseconds;
+                    if (recoveredMs >= 0 || watch.ElapsedMilliseconds > 6500) { timer.Stop(); context.ExitThread(); }
+                };
+                timer.Start();
+                Application.Run(context);
+            }
+            context.Dispose();
+            Check("60-second polling still retries unknown country in " + recoveredMs + " ms",
+                sawUnknown && lookup.Calls == 2 && recoveredMs >= 4500 && recoveredMs < 6500);
+        }
         private static void IconTests()
         {
             int count = 0;
