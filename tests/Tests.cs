@@ -46,7 +46,7 @@ namespace IPCountryWatcher
                 Country = call > 1 ? "美国" : null, CheckedUtc = DateTime.UtcNow });
         }
     }
-    internal static class Tests
+    internal static partial class Tests
     {
         private static readonly List<string> report = new List<string>();
         private static int failures;
@@ -65,16 +65,20 @@ namespace IPCountryWatcher
         { return "{\"success\":true,\"ip\":\"" + ip + "\",\"country_code\":\"" + code + "\",\"country\":\"Test\"}"; }
 
         [STAThread]
-        private static int Main()
+        private static int Main(string[] args)
         {
             try
             {
+                if (args.Length == 1 && args[0] == "--ui-only")
+                { Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false); ProcessWindowTest(); return failures == 0 ? 0 : 1; }
+                ProcessTests().GetAwaiter().GetResult();
                 CoreTests().GetAwaiter().GetResult();
                 LatencyTests().GetAwaiter().GetResult();
                 IconTests();
                 SmokeTest();
                 TrayLatencyTest();
                 TrayRetryTest();
+                ProcessWindowTest();
             }
             catch (Exception ex) { Check("Unhandled exception: " + ex, false); }
             Directory.CreateDirectory("test-results");

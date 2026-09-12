@@ -19,12 +19,16 @@ namespace IPCountryWatcher
         private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         private readonly RefreshSchedule schedule = new RefreshSchedule();
         private readonly ToolStripMenuItem title = new ToolStripMenuItem("IP 国旗监视器");
-        private readonly ToolStripMenuItem ipItem = new ToolStripMenuItem("公网 IP：正在查询…");
+        private readonly ToolStripMenuItem ipItem = new ToolStripMenuItem("本程序公网 IP：正在查询…");
         private readonly ToolStripMenuItem countryItem = new ToolStripMenuItem("国家 / 地区：待识别");
         private readonly ToolStripMenuItem statusItem = new ToolStripMenuItem("正在启动");
         private readonly ToolStripMenuItem timeItem = new ToolStripMenuItem("尚未完成查询");
         private readonly ToolStripMenuItem copyItem = new ToolStripMenuItem("复制公网 IP");
         private readonly ToolStripMenuItem startupItem = new ToolStripMenuItem("开机启动");
+        private readonly ToolStripMenuItem processesItem = new ToolStripMenuItem("进程 IP 监控…");
+        private readonly System.Windows.Forms.Timer processTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+        private ProcessMonitor processMonitor;
+        private ProcessMonitorForm processForm;
         private Icon ownedIcon;
         private string iconCode = "#";
         private Snapshot current;
@@ -63,6 +67,9 @@ namespace IPCountryWatcher
                 interval.DropDownItems.Add(item);
             }
             menu.Items.Add(interval);
+            processesItem.Click += (s, e) => ShowProcessMonitor();
+            menu.Items.Add(processesItem);
+            menu.Items.Add("监控应用设置…", null, (s, e) => EditApplications());
             var proxy = new ToolStripMenuItem("跟随 Windows 系统代理") { Checked = settings.UseSystemProxy, CheckOnClick = true };
             proxy.Click += (s, e) => { settings.UseSystemProxy = proxy.Checked; SaveSettings(); RequestRefresh(); };
             menu.Items.Add(proxy);
@@ -88,7 +95,49 @@ namespace IPCountryWatcher
             NetworkChange.NetworkAvailabilityChanged += AvailabilityChanged;
             SystemEvents.PowerModeChanged += PowerChanged;
             timer.Start();
+            processTimer.Tick += async (s, e) => {
+                if (closing || processMonitor == null) return;
+                await processMonitor.PollAsync();
+            };
+            if (!testing && settings.MonitoredApplications.Exists(a => a.Enabled)) EnsureProcessMonitor();
             dispatcher.BeginInvoke((Action)(() => Tick(null, EventArgs.Empty)));
+        }
+
+        private void EnsureProcessMonitor()
+        {
+            if (processMonitor != null) return;
+            processMonitor = new ProcessMonitor(settings, new NativeProcessProbe(), new LookupService(new HttpTransport(), () => DateTime.UtcNow));
+            processTimer.Start();
+        }
+
+        internal void ShowProcessMonitor()
+        {
+            EnsureProcessMonitor();
+            if (processForm == null || processForm.IsDisposed)
+                processForm = new ProcessMonitorForm(processMonitor, () => current, EditApplications,
+                    () => processMonitor.Invalidate(), testing);
+            processForm.Show();
+            if (processForm.WindowState == FormWindowState.Minimized) processForm.WindowState = FormWindowState.Normal;
+            processForm.Activate();
+        }
+
+        private void EditApplications()
+        {
+            using (var form = new ApplicationSettingsForm(settings))
+            {
+                if (form.ShowDialog(processForm != null && !processForm.IsDisposed ? processForm : null) != DialogResult.OK) return;
+                var previous = settings.MonitoredApplications;
+                int interval = settings.ProcessPollSeconds;
+                settings.MonitoredApplications = form.Applications;
+                settings.ProcessPollSeconds = form.PollSeconds;
+                try { if (!testing) settings.Save(); }
+                catch (Exception ex)
+                {
+                    settings.MonitoredApplications = previous; settings.ProcessPollSeconds = interval;
+                    ShowError("无法保存监控设置：" + ex.Message); return;
+                }
+                EnsureProcessMonitor(); processMonitor.Invalidate();
+            }
         }
 
         private void SaveSettings()
@@ -128,12 +177,13 @@ namespace IPCountryWatcher
         {
             if (closing) return;
             schedule.Request(DateTime.UtcNow, debounce);
+            if (processMonitor != null) processMonitor.Invalidate();
             if (activeRequest != null) activeRequest.Cancel();
             current = null;
             copyItem.Enabled = false;
             SetIcon(null);
             statusItem.Text = "正在重新确认网络出口…";
-            ipItem.Text = "公网 IP：正在查询…";
+            ipItem.Text = "本程序公网 IP：正在查询…";
             countryItem.Text = "国家 / 地区：待识别";
             tray.Text = "IP 国旗监视器 · 正在重新查询";
             if (debounce == TimeSpan.Zero) Tick(null, EventArgs.Empty);
@@ -180,7 +230,7 @@ namespace IPCountryWatcher
             Snapshot previous = lastKnown;
             current = result;
             SetIcon(result.CountryCode);
-            ipItem.Text = "公网 IP：" + (result.Ip ?? "无法获取");
+            ipItem.Text = "本程序公网 IP：" + (result.Ip ?? "无法获取");
             countryItem.Text = "国家 / 地区：" + (result.HasCountry ? result.Country + " (" + result.CountryCode + ")" : "暂未识别");
             statusItem.Text = result.Error ?? "监控中 · " + result.Source;
             timeItem.Text = "检查时间：" + result.CheckedUtc.ToLocalTime().ToString("HH:mm:ss");
@@ -243,6 +293,9 @@ namespace IPCountryWatcher
             if (closing) return;
             closing = true;
             timer.Stop();
+            processTimer.Stop(); processTimer.Dispose();
+            if (processMonitor != null) processMonitor.Dispose();
+            if (processForm != null) processForm.Dispose();
             NetworkChange.NetworkAddressChanged -= NetworkChanged;
             NetworkChange.NetworkAvailabilityChanged -= AvailabilityChanged;
             SystemEvents.PowerModeChanged -= PowerChanged;

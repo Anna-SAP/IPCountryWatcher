@@ -16,6 +16,7 @@ if (!(Test-Path -LiteralPath $compiler)) {
 }
 if (!(Test-Path -LiteralPath $compiler)) { throw '.NET Framework C# compiler not found.' }
 New-Item -ItemType Directory -Force bin, obj, test-results | Out-Null
+. (Join-Path $PSScriptRoot 'native/build-native.ps1') -ProjectRoot $PSScriptRoot
 $flags = @(Get-ChildItem -LiteralPath assets\flags -Filter *.png)
 if ($flags.Count -lt 240) { throw 'Missing bundled flag assets. Restore assets/flags before building.' }
 $common = @('/nologo', '/utf8output', '/optimize+', '/warn:4', '/warnaserror+', '/langversion:5', '/platform:anycpu',
@@ -38,7 +39,7 @@ Copy-Item -LiteralPath app.config -Destination bin\IPCountryWatcher.exe.config -
 Copy-Item -LiteralPath README.md,THIRD-PARTY-NOTICES.md -Destination bin -Force
 Write-Output "Built bin/IPCountryWatcher.exe v$Version with $($flags.Count) embedded flags."
 if ($Test) {
-    Invoke-Compile ($common + @('/target:exe', '/main:IPCountryWatcher.Tests', '/out:bin/IPCountryWatcher.Tests.exe', 'tests\Tests.cs')) 'obj/tests.rsp'
+    Invoke-Compile ($common + @('/target:exe', '/main:IPCountryWatcher.Tests', '/out:bin/IPCountryWatcher.Tests.exe', 'tests\*.cs')) 'obj/tests.rsp'
     & .\bin\IPCountryWatcher.Tests.exe
     if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
 }
@@ -46,7 +47,8 @@ $packages = @()
 if ($Package -or $Installer) {
     New-Item -ItemType Directory -Force dist | Out-Null
     $portable = 'dist\IPCountryWatcher-portable.zip'
-    Compress-Archive -LiteralPath bin\IPCountryWatcher.exe,bin\IPCountryWatcher.exe.config,bin\README.md,bin\THIRD-PARTY-NOTICES.md -DestinationPath $portable -Force
+    $payload = @('bin\IPCountryWatcher.exe', 'bin\IPCountryWatcher.exe.config', 'bin\README.md', 'bin\THIRD-PARTY-NOTICES.md') + @(Get-ChildItem -Path bin\IPCountryWatcher.Probe.*.dll,bin\IPCountryWatcher.ProbeHost.*.exe | ForEach-Object { $_.FullName })
+    Compress-Archive -LiteralPath $payload -DestinationPath $portable -Force
     $packages += $portable
     Write-Output "Packaged $portable"
 }

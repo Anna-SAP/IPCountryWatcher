@@ -41,6 +41,9 @@ Source: "..\bin\IPCountryWatcher.exe.config"; DestDir: "{app}"; Flags: ignorever
 Source: "..\bin\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\bin\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 
+Source: "..\bin\IPCountryWatcher.Probe.*.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\bin\IPCountryWatcher.ProbeHost.*.exe"; DestDir: "{app}"; Flags: ignoreversion
+
 [Icons]
 Name: "{group}\IP 国旗监视器"; Filename: "{app}\IPCountryWatcher.exe"
 Name: "{autodesktop}\IP 国旗监视器"; Filename: "{app}\IPCountryWatcher.exe"; Tasks: desktopicon

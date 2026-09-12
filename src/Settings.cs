@@ -9,7 +9,9 @@ namespace IPCountryWatcher
         public int PollSeconds { get; set; }
         public bool UseSystemProxy { get; set; }
         public bool NotifyOnChange { get; set; }
-        public Settings() { PollSeconds = 5; UseSystemProxy = true; NotifyOnChange = true; }
+        public int ProcessPollSeconds { get; set; }
+        public System.Collections.Generic.List<MonitoredApplication> MonitoredApplications { get; set; }
+        public Settings() { PollSeconds = 5; UseSystemProxy = true; NotifyOnChange = true; ProcessPollSeconds = 30; MonitoredApplications = MonitoredApplication.Defaults(); }
         internal static string Folder { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "IPCountryWatcher"); } }
         internal static Settings Load()
         {
@@ -21,6 +23,9 @@ namespace IPCountryWatcher
                 if (settings == null) return new Settings();
                 if (settings.PollSeconds != 5 && settings.PollSeconds != 10 && settings.PollSeconds != 30 && settings.PollSeconds != 60)
                     settings.PollSeconds = 5;
+                if (settings.ProcessPollSeconds != 15 && settings.ProcessPollSeconds != 30 && settings.ProcessPollSeconds != 60) settings.ProcessPollSeconds = 30;
+                if (settings.MonitoredApplications == null) settings.MonitoredApplications = MonitoredApplication.Defaults();
+                MonitoredApplication.Validate(settings.MonitoredApplications);
                 return settings;
             }
             catch (Exception ex)

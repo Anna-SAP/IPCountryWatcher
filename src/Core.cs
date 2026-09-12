@@ -152,6 +152,14 @@ namespace IPCountryWatcher
             token.ThrowIfCancellationRequested();
             if (address == null) return new Snapshot { Error = "公网 IP 查询失败：请检查网络、代理或稍后重试", CheckedUtc = clock() };
 
+            return await ResolveCountryAsync(address.Ip, systemProxy, token, address.Source).ConfigureAwait(false);
+        }
+
+        // Resolve an explicit observed IP; never query this monitor's own egress as a substitute.
+        internal async Task<Snapshot> ResolveCountryAsync(string ip, bool systemProxy, CancellationToken token, string source)
+        {
+            var address = new Snapshot { Ip = Validation.PublicIp(ip), Source = source };
+            token.ThrowIfCancellationRequested();
             Snapshot cached;
             if (cache.TryGetValue(address.Ip, out cached) && clock() - cached.CheckedUtc < TimeSpan.FromHours(24))
                 return new Snapshot { Ip = address.Ip, CountryCode = cached.CountryCode, Country = cached.Country,
