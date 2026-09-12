@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'native/**'
       - 'assets/**'
       - 'tests/**'
       - 'installer/**'
@@ -17,6 +18,7 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'native/**'
       - 'assets/**'
       - 'tests/**'
       - 'installer/**'

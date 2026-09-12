@@ -9,7 +9,7 @@ $log = Join-Path $PWD 'test-results\installer.log'
 $setup = Join-Path $PWD 'dist\IPCountryWatcher-Setup.exe'
 $result = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$target`"", "/LOG=`"$log`"") -WindowStyle Hidden -Wait -PassThru
 if ($result.ExitCode -ne 0) { throw "Installer failed: $($result.ExitCode)" }
-$expected = @('IPCountryWatcher.exe', 'IPCountryWatcher.exe.config', 'README.md', 'THIRD-PARTY-NOTICES.md')
+$expected = @('IPCountryWatcher.exe', 'IPCountryWatcher.exe.config', 'README.md', 'THIRD-PARTY-NOTICES.md', 'IPCountryWatcher.Probe.x64.dll', 'IPCountryWatcher.Probe.x86.dll', 'IPCountryWatcher.ProbeHost.x64.exe', 'IPCountryWatcher.ProbeHost.x86.exe')
 foreach ($name in $expected) {
     $installed = Join-Path $target $name
     if (!(Test-Path -LiteralPath $installed)) { throw "Missing installed file: $name" }

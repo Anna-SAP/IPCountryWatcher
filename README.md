@@ -1,4 +1,4 @@
-# IP 国旗监视器（Windows 11）
+﻿# IP 国旗监视器（Windows 11）
 
 [![Windows build](https://github.com/Anna-SAP/IPCountryWatcher/actions/workflows/build.yml/badge.svg)](https://github.com/Anna-SAP/IPCountryWatcher/actions/workflows/build.yml)
 
@@ -10,7 +10,7 @@
 
 ## 直接使用
 
-双击 **bin/IPCountryWatcher.exe**。无需管理员权限，无需安装 Python 或 .NET SDK。发布时请保留同目录的 .exe.config 和说明文件。
+双击 **bin/IPCountryWatcher.exe**。无需管理员权限，无需安装 Python 或 .NET SDK。发布时请保留同目录的 .exe.config、说明文件和四个 Probe / ProbeHost 组件。
 如果未看见图标，展开右下角的隐藏图标区域；可以把图标拖到任务栏，或在 Windows 的任务栏设置中启用其显示。应用不能强制绕过 Windows 的托盘折叠设置。
 
 - 悬停：查看国家代码和当前公网 IP。
@@ -33,7 +33,36 @@
 默认跟随 Windows 系统代理；取消该项后使用本机路由直接发出请求（VPN/TUN 仍可能影响路由）。
 每轮重新获取代理配置。浏览器插件、应用专用 SOCKS 代理及按域名分流可能产生不同出口，显示结果仅代表本程序查询服务看到的出口。
 优先查询公网 IPv4（api.ipify.org，慢于 200 毫秒或失败时并发启动 checkip.amazonaws.com，采用最先验证成功的结果）；两者失败或达到本组超时后才使用 api64.ipify.org 尝试 IPv4/IPv6。按域名分流时，这两个 IPv4 服务也可能看到不同出口。
-仅展示一个当前出口，不同时列出所有网卡和双栈地址；切换到 IPv6 备用查询源也可能表现为 IP 变化。
+托盘顶部仅展示本程序的一个当前出口；进程监控窗口独立列出目标进程的双栈结果。切换到 IPv6 备用查询源也可能表现为 IP 变化。
+
+## 进程 IP 监控（VPN 分流 / 代理绕过）
+
+托盘右键 → **监控应用设置**，选择目标 EXE 并勾选“启用探针”；再打开 **进程 IP 监控** 查看独立结果。预置爱奇艺、腾讯视频、优酷视频、QQ音乐、哔哩哔哩、微信 WeChat、ChatGPT、Claude、Grok Bot 的可编辑条目，可增加、删除、改名或停用。预置名称不等于已适配或已实测，默认不启用任何探针。
+
+- 使用“从运行进程选择”绑定真实 EXE，或浏览文件。“匹配已运行的预置应用”只填入检测到的路径，不自动启用探针。应用升级改变安装路径后需重新选择；ChatGPT 的匹配会排除 Codex 的同名可执行文件。
+- 按 **完整 EXE 路径 + PID + 进程创建时间** 区分实例。优先探测该 EXE 中拥有已建立非回环 TCP 连接的进程；无此连接时选择最早启动的一个实例。窗口分别列出选中的 PID、IPv4/IPv6、公网 IP、国家、探针模式、时间和失败状态。
+- 默认每个结果完成后约 30 秒进入下一轮，可设 15 / 30 / 60 秒；最多同时执行两个探针，排队、超时和国家查询会延长实际间隔。关闭窗口后仍持续监控，退出托盘程序或在设置中停用可停止后续探测。
+- 手动刷新、网络地址变化、网络可用性变化及睡眠恢复会使旧结果失效。超过 90 秒的结果标为过期；进程退出、PID 复用、查询失败时不会拿本程序 IP 或旧国家填充。
+- **直连（含 VPN）**：进程内 WinHTTP 不使用 HTTP 系统代理，但连接仍受 PrivadoVPN 等产品针对该进程的分流策略影响。**系统代理**：使用 Windows 自动代理配置，不读取目标应用内部的 SOCKS/HTTP 代理设置。
+
+### 探测原理与边界
+
+仅查询 Windows TCP 表只能得到本地端点、对端和所属 PID；本地网卡地址、服务器 IP 或 VPN 路由本身无法证明 NAT / 代理后的公网出口。此功能由配套的 x86/x64 DLL 在目标进程中请求固定 HTTPS 地址，并将结果通过该进程的内存回传给监视器。国家查询由监视器针对这个明确 IP 进行，复用缓存、超时与限流处理，不以监视器自己的出口替代。
+
+IPv4 使用 api.ipify.org，失败后尝试 checkip.amazonaws.com；IPv6 独立使用 api6.ipify.org。界面保留实际获胜查询源。IPv6 不可用不会抹掉有效 IPv4，反之亦然。结果代表**这个 PID 在所选探针模式下访问测试服务时的出口**，不承诺目标应用访问所有网站、UDP/QUIC、内置代理或其它联网子进程都使用相同出口。共享 WebView、Python 等宿主需自行选择实际联网 EXE；不会自动把其它程序的共享宿主归到某个应用。
+
+进程内加载可能被 DRM、反作弊、沙箱、受保护进程或权限隔离拦截，也可能影响兼容性。探针只允许同一 Windows 用户和会话，不申请调试特权、不提权、不绕过应用保护；访问拒绝会显示原因。当前支持 x64 Windows 上的 x86/x64 进程。加载超时等不可恢复错误在该进程本次生命周期内停止自动重试。
+
+正常完成后卸载 DLL。网络事件、停用或退出时，已在目标内执行的请求会继续完成清理，但结果不再接收；不会强制终止目标线程。如果目标线程长时间无响应，为避免释放仍在使用的内存，DLL/小块参数内存可能保留至目标应用退出；重启目标应用可恢复探测。不要在探针执行期间升级组件，建议先退出监视器并等待在途请求结束。
+
+### PrivadoVPN 实机验收
+
+1. 启动目标应用，在监控设置中绑定它的完整 EXE 并启用，选择“直连（含 VPN）”。
+2. 记录该应用测试服务的 IP；在 PrivadoVPN SmartRoute 中对**同一个联网 EXE**设置通过隧道或绕过。
+3. 等待 VPN 策略生效，再点“立即重新探测”，比较同一地址族及同一测试服务的 IP。必要时按 VPN 的要求重启目标应用。
+4. 切换规则后若返回相同 IP，只能说明该次测试看到了相同出口；检查规则选中的 EXE、子进程和测试站点规则，不从网卡名称猜测结论。
+5. 无法连接、IPv6 不可用、权限不足、应用保护等均应显示明确状态。九个预置应用并不保证均允许加载探针，应逐一验证。
+
 
 ## 国家与国旗
 
@@ -47,7 +76,7 @@
 
 运行程序会向 ipify / AWS checkip 发起 HTTPS 请求以查询本机公网 IP，向 ipwho.is / ipapi.co 提交该 IP 查询国家；这些服务会获知请求来源的公网 IP。
 所有查询使用 HTTPS；不发送姓名、设备名、本机私有 IP 或浏览历史。未添加遥测和 IP 历史文件。
-设置保存至 %LOCALAPPDATA%/IPCountryWatcher/settings.json。国家缓存仅在进程内。
+设置（含所选应用名称、EXE 路径、启用状态和探针模式）保存至 %LOCALAPPDATA%/IPCountryWatcher/settings.json。进程列表和测量结果只保留在内存，未发送给查询服务；公网查询只发送必要的 IP 请求。国家缓存仅在进程内。
 服务需要互联网访问；未配置付费密钥，免费服务限流或不可用时程序会显示状态并自动重试。
 
 ## 构建与测试
@@ -58,9 +87,10 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Test
 ~~~
 
-build.ps1 使用 Windows 随附的 .NET Framework C# 编译器，无 NuGet 下载、无 SDK 安装。
+build.ps1 使用 Windows 随附的 .NET Framework C# 编译器，以及 Visual Studio Build Tools 的“使用 C++ 的桌面开发”（MSVC x86/x64 和 Windows 10/11 SDK）。构建不下载 NuGet；运行已发布应用不需要安装这些开发工具。
 也提供 IPCountryWatcher.csproj，供安装了 .NET Framework 4.8 开发工具的 Visual Studio 使用。
 测试使用内存中的模拟 HTTP 服务，不向公网接口发送请求；覆盖 IP / JSON 验证、缓存、快速失败恢复、独立限流、延迟启动备用源、忽略取消的慢请求、并发结果过期保护、IPv4 优先与 IPv6 回退、国旗资源和真实 WinForms 托盘显示延迟。
+新增离线测试还会在本项目自建的 x86/x64 测试进程中验证 DLL 加载、PID 回传、卸载、再次加载和错误身份拒绝；不会向第三方应用加载 DLL，也不会发起公网请求。窗口预览输出至 test-results/process-monitor-preview.png 和 process-settings-preview.png。
 测试日志在 test-results/results.txt，测试时会短暂出现托盘图标并自动退出。
 
 真实联网查询和 VPN / Wi-Fi 切换验收尚需在允许访问上述服务的环境中进行。验收时应确认：
@@ -78,7 +108,7 @@ build.ps1 使用 Windows 随附的 .NET Framework C# 编译器，无 NuGet 下�
 
 工作流位于 [.github/workflows/build.yml](.github/workflows/build.yml)：
 
-1. 向 **main** 推送 src、assets、tests、installer、build.ps1、项目文件、应用配置或工作流改动时自动运行；仅修改 README 等说明文档不触发。也可从 Actions 手动运行。
+1. 向 **main** 推送 src、native、assets、tests、installer、build.ps1、项目文件、应用配置或工作流改动时自动运行；仅修改 README 等说明文档不触发。也可从 Actions 手动运行。
 2. Windows Server 2022 runner 编译 C#，运行离线测试，并使用预装的 Inno Setup 6 生成安装包。
 3. 在临时 runner 中静默安装，校验文件哈希、确认应用未自动启动，再静默卸载。此过程不发起公网 IP 查询。
 4. 保存测试报告、Setup.exe、便携 ZIP 和 SHA256 校验文件。主分支成功构建后自动创建 GitHub Release 并标记为 Latest；PR 仅验证和保存工件，不发布。
@@ -96,6 +126,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Test -Package -
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Test -Installer -Version 1.0.1
 ~~~
 
+便携包和安装包均包含 x86/x64 的探针 DLL 与加载器；离线测试用的 ProbeFixture 不随应用分发。
 构建结果：dist/IPCountryWatcher-Setup.exe、dist/IPCountryWatcher-portable.zip、dist/SHA256SUMS.txt。
 仓库提交全部源代码、测试与国旗资源；bin、obj、dist、test-results 为自动生成目录，不提交到 Git。
 
@@ -108,3 +139,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Test -Installer
 - 国旗资源：https://flagpedia.net/download/api
 
 第三方来源见 THIRD-PARTY-NOTICES.md。
+
+进程探测相关官方资料：
+- [Windows TCP 连接表与 PID](https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getextendedtcptable)
+- [WFP 应用层身份与网络策略](https://learn.microsoft.com/en-us/windows/win32/fwp/application-layer-enforcement--ale-)
+- [跨进程线程及兼容性影响](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createremotethread)
+- [PrivadoVPN 应用分流](https://privadovpn.com/split-tunneling/)

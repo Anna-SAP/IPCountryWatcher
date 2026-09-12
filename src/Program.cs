@@ -9,7 +9,7 @@ namespace IPCountryWatcher
     internal static class Program
     {
         [STAThread]
-        private static void Main()
+        private static void Main(string[] args)
         {
             bool created;
             using (var mutex = new Mutex(true, @"Local\IPCountryWatcher.Desktop.v1", out created))
@@ -26,7 +26,10 @@ namespace IPCountryWatcher
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
                     using (var context = new TrayContext(new LookupService(new HttpTransport(), () => DateTime.UtcNow), Settings.Load(), false))
+                    {
+                        if (Array.IndexOf(args, "--process-monitor") >= 0) context.ShowProcessMonitor();
                         Application.Run(context);
+                    }
                 }
                 catch (Exception ex)
                 {
