@@ -99,16 +99,17 @@ namespace IPCountryWatcher
         private async void ChooseRunning()
         {
             int index = SelectedIndex; if (index < 0) return;
+            var selectedEntry = entries[index];
             try
             {
                 var apps = await Task.Run(() => ProcessNetwork.Applications());
-                if (IsDisposed) return;
+                if (IsDisposed || !entries.Contains(selectedEntry)) return;
                 using (var picker = new RunningApplicationForm(apps))
                 {
                     if (picker.ShowDialog(this) != DialogResult.OK) return;
-                    SyncRows(); entries[index].ExecutablePath = picker.Selected.Path;
-                    if (entries[index].Name == "新应用") entries[index].Name = picker.Selected.Name;
-                    Reload(index);
+                    SyncRows(); selectedEntry.ExecutablePath = picker.Selected.Path;
+                    if (selectedEntry.Name == "新应用") selectedEntry.Name = picker.Selected.Name;
+                    Reload(entries.IndexOf(selectedEntry));
                 }
             }
             catch (Exception ex) { if (!IsDisposed) MessageBox.Show(this, ex.Message, "读取进程失败"); }
