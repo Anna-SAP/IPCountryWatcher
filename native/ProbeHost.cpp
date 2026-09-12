@@ -81,10 +81,17 @@ int wmain(int argc, wchar_t** argv) {
     if (!process) return Fail(GetLastError(), "open");
     FILETIME birth, exit, kernel, user;
     wchar_t actual[32768]; DWORD actualSize = 32768;
-    if (!SameUser(process) || !GetProcessTimes(process, &birth, &exit, &kernel, &user) ||
-        !QueryFullProcessImageNameW(process, 0, actual, &actualSize) ||
-        created != ((static_cast<unsigned __int64>(birth.dwHighDateTime) << 32) | birth.dwLowDateTime) ||
-        _wcsicmp(actual, argv[4]) != 0) { CloseHandle(process); return Fail(ERROR_ACCESS_DENIED, "identity"); }
+    if (!SameUser(process)) { CloseHandle(process); return Fail(ERROR_ACCESS_DENIED, "owner"); }
+    if (!GetProcessTimes(process, &birth, &exit, &kernel, &user)) {
+        DWORD error = GetLastError(); CloseHandle(process); return Fail(error, "created-read");
+    }
+    if (created != ((static_cast<unsigned __int64>(birth.dwHighDateTime) << 32) | birth.dwLowDateTime)) {
+        CloseHandle(process); return Fail(ERROR_INVALID_PARAMETER, "created-mismatch");
+    }
+    if (!QueryFullProcessImageNameW(process, 0, actual, &actualSize)) {
+        DWORD error = GetLastError(); CloseHandle(process); return Fail(error, "image-query");
+    }
+    if (_wcsicmp(actual, argv[4]) != 0) { CloseHandle(process); return Fail(ERROR_ACCESS_DENIED, "image-mismatch"); }
     wchar_t dll[MAX_PATH];
     DWORD size = GetModuleFileNameW(NULL, dll, MAX_PATH);
     wchar_t* leaf = wcsrchr(dll, L'\\');

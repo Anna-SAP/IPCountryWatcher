@@ -61,8 +61,9 @@ namespace IPCountryWatcher
             foreach (string arch in new[] { "x86", "x64" })
             {
                 string fixturePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "IPCountryWatcher.ProbeFixture." + arch + ".exe");
-                using (var fixture = Process.Start(new ProcessStartInfo(fixturePath) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true }))
+                using (var fixture = Process.Start(new ProcessStartInfo(fixturePath) { UseShellExecute = false, CreateNoWindow = true }))
                 {
+                    using (var stop = OpenFixtureSignal(fixture.Id))
                     try
                     {
                         var identity = ProcessIdentity.Read(fixture.Id);
@@ -78,10 +79,10 @@ namespace IPCountryWatcher
                         using (var bad = Process.Start(new ProcessStartInfo(helper, args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true }))
                         {
                             string text = bad.StandardOutput.ReadToEnd(); bad.WaitForExit();
-                            Check("Native loader independently rejects wrong creation time " + arch, bad.ExitCode != 0 && text.Contains("identity"));
+                            Check("Native loader independently rejects wrong creation time " + arch, bad.ExitCode != 0 && text.Contains("created-mismatch"));
                         }
                     }
-                    finally { fixture.StandardInput.WriteLine(); if (!fixture.WaitForExit(5000)) fixture.Kill(); }
+                    finally { stop.Set(); if (!fixture.WaitForExit(5000)) fixture.Kill(); }
                 }
             }
 
@@ -114,6 +115,20 @@ namespace IPCountryWatcher
                 monitorSettings.MonitoredApplications.Clear();
                 monitor.Invalidate(); await monitor.PollAsync();
                 Check("Deleting a configured app removes its monitor rows", monitor.Rows.Count == 0);
+            }
+        }
+
+        private static EventWaitHandle OpenFixtureSignal(int pid)
+        {
+            var watch = Stopwatch.StartNew();
+            while (true)
+            {
+                try { return EventWaitHandle.OpenExisting("Local\\IPCountryWatcher.ProbeFixture." + pid); }
+                catch (WaitHandleCannotBeOpenedException)
+                {
+                    if (watch.ElapsedMilliseconds > 5000) throw;
+                    Thread.Sleep(20);
+                }
             }
         }
 
