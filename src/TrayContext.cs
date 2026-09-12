@@ -74,7 +74,7 @@ namespace IPCountryWatcher
             menu.Items.Add(startupItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("关于", null, (s, e) => MessageBox.Show(
-                "IP 国旗监视器 " + Application.ProductVersion + "\n\n网络变化时自动检查，定时轮询公网出口。\n灰色地球表示正在查询或结果未确认。\n\nIP：ipify / AWS checkip\n国家：ipwho.is\n国旗：Flagpedia.net / flagcdn.com（已内嵌）\n\n这些查询服务会获知请求的公网 IP。\n显示的是本程序请求所经过的出口，分流代理下\n可能与浏览器或其他应用不同。\n\n双击图标可立即刷新；右键打开菜单。",
+                "IP 国旗监视器 " + Application.ProductVersion + "\n\n网络变化时自动检查，定时轮询公网出口。\n灰色地球表示正在查询或结果未确认。\n\nIP：ipify / AWS checkip\n国家：ipwho.is / ipapi.co\n国旗：Flagpedia.net / flagcdn.com（已内嵌）\n\n这些查询服务会获知请求的公网 IP。\n显示的是本程序请求所经过的出口，分流代理下\n可能与浏览器或其他应用不同。\n\n双击图标可立即刷新；右键打开菜单。",
                 "关于 IP 国旗监视器", MessageBoxButtons.OK, MessageBoxIcon.Information));
             menu.Items.Add("退出", null, (s, e) => ExitThread());
             tray.ContextMenuStrip = menu;
@@ -82,12 +82,13 @@ namespace IPCountryWatcher
             SetIcon(null);
             tray.Text = "IP 国旗监视器 · 正在查询";
             tray.Visible = true;
-            timer.Interval = 250;
+            timer.Interval = 100;
             timer.Tick += Tick;
             NetworkChange.NetworkAddressChanged += NetworkChanged;
             NetworkChange.NetworkAvailabilityChanged += AvailabilityChanged;
             SystemEvents.PowerModeChanged += PowerChanged;
             timer.Start();
+            dispatcher.BeginInvoke((Action)(() => Tick(null, EventArgs.Empty)));
         }
 
         private void SaveSettings()
@@ -116,14 +117,17 @@ namespace IPCountryWatcher
         private void PostRefresh()
         {
             if (closing) return;
-            try { dispatcher.BeginInvoke((Action)(() => RequestRefresh())); }
+            try { dispatcher.BeginInvoke((Action)(() => RequestRefresh(TimeSpan.FromMilliseconds(200)))); }
             catch (InvalidOperationException) { /* Dispatcher is closing. */ }
         }
 
         internal void RequestRefresh()
+        { RequestRefresh(TimeSpan.Zero); }
+
+        private void RequestRefresh(TimeSpan debounce)
         {
             if (closing) return;
-            schedule.Request(DateTime.UtcNow, TimeSpan.FromMilliseconds(400));
+            schedule.Request(DateTime.UtcNow, debounce);
             if (activeRequest != null) activeRequest.Cancel();
             current = null;
             copyItem.Enabled = false;
@@ -132,6 +136,7 @@ namespace IPCountryWatcher
             ipItem.Text = "公网 IP：正在查询…";
             countryItem.Text = "国家 / 地区：待识别";
             tray.Text = "IP 国旗监视器 · 正在重新查询";
+            if (debounce == TimeSpan.Zero) Tick(null, EventArgs.Empty);
         }
 
         private async void Tick(object sender, EventArgs args)
@@ -164,6 +169,8 @@ namespace IPCountryWatcher
                 activeRequest = null;
                 request.Dispose();
                 double seconds = Math.Min(60, settings.PollSeconds * Math.Pow(2, failures));
+                // An unresolved country must not wait for a long user-selected IP polling interval.
+                if (current != null && current.HasIp && !current.HasCountry) seconds = Math.Min(5, seconds);
                 schedule.Complete(generation, DateTime.UtcNow, TimeSpan.FromSeconds(seconds));
             }
         }

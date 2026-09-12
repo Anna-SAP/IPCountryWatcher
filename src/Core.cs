@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Net;
@@ -101,18 +101,22 @@ namespace IPCountryWatcher
         }
 
         public static Snapshot CountryJson(string json, string expectedIp)
+        { return CountryJson(json, expectedIp, false); }
+
+        public static Snapshot CountryJson(string json, string expectedIp, bool ipapi)
         {
             var serializer = new JavaScriptSerializer { MaxJsonLength = 16384 };
             var data = serializer.Deserialize<Dictionary<string, object>>(json);
             object success;
-            if (data == null || !data.TryGetValue("success", out success) || !(success is bool) || !(bool)success)
+            if (data == null || (ipapi ? data.ContainsKey("error") :
+                !data.TryGetValue("success", out success) || !(success is bool) || !(bool)success))
                 throw new FormatException("国家查询未成功");
             string ip = GetString(data, "ip");
             if (PublicIp(ip) != expectedIp) throw new FormatException("国家查询返回的 IP 不匹配");
             string code = GetString(data, "country_code").ToUpperInvariant();
             if (code.Length != 2 || code[0] < 'A' || code[0] > 'Z' || code[1] < 'A' || code[1] > 'Z')
                 throw new FormatException("国家代码无效");
-            string country = GetString(data, "country");
+            string country = GetString(data, ipapi ? "country_name" : "country");
             try { country = new RegionInfo(code).DisplayName; } catch (ArgumentException) { }
             return new Snapshot { Ip = expectedIp, CountryCode = code, Country = country.Length == 0 ? code : country };
         }
@@ -130,76 +134,139 @@ namespace IPCountryWatcher
         private readonly Func<DateTime> clock;
         private readonly Dictionary<string, Snapshot> cache = new Dictionary<string, Snapshot>();
         private readonly Dictionary<string, DateTime> endpointCooldown = new Dictionary<string, DateTime>();
-        private DateTime geoRetryUtc = DateTime.MinValue;
-        private const string GeoBase = "https://ipwho.is/";
+        private readonly object cooldownLock = new object();
+        internal const int HedgeMilliseconds = 200;
+        internal const int StageTimeoutMilliseconds = 4000;
         internal static readonly string[] IpUrls = { "https://api.ipify.org", "https://checkip.amazonaws.com", "https://api64.ipify.org" };
 
         public LookupService(ITransport transport, Func<DateTime> clock)
         { this.transport = transport; this.clock = clock; }
 
-        // Called serially by the UI scheduler; no concurrent cache mutation.
+        // The UI serializes rounds. Only the winning, validated result may enter the cache.
         public async Task<Snapshot> QueryAsync(bool systemProxy, CancellationToken token)
         {
-            string ip = null;
-            string source = null;
-            foreach (string url in IpUrls)
-            {
-                token.ThrowIfCancellationRequested();
-                DateTime until;
-                if (endpointCooldown.TryGetValue(url, out until) && clock() < until) continue;
-                try
-                {
-                    ip = Validation.PublicIp(await transport.GetAsync(url, systemProxy, token).ConfigureAwait(false));
-                    source = new Uri(url).Host;
-                    break;
-                }
-                catch (RateLimitException ex) { endpointCooldown[url] = clock().Add(ex.RetryAfter); }
-                catch (OperationCanceledException) { token.ThrowIfCancellationRequested(); }
-                catch (Exception ex) { if (!(ex is HttpRequestException || ex is FormatException || ex is WebException)) throw; }
-            }
+            Snapshot address = await RaceAsync(new[] { IpUrls[0], IpUrls[1] }, null, systemProxy, token).ConfigureAwait(false);
+            // Preserve IPv4 preference; do not race IPv6 against a working IPv4 path.
+            if (address == null)
+                address = await RaceAsync(new[] { IpUrls[2] }, null, systemProxy, token).ConfigureAwait(false);
             token.ThrowIfCancellationRequested();
-            if (ip == null) return new Snapshot { Error = "公网 IP 查询失败：请检查网络、代理或稍后重试", CheckedUtc = clock() };
+            if (address == null) return new Snapshot { Error = "公网 IP 查询失败：请检查网络、代理或稍后重试", CheckedUtc = clock() };
 
             Snapshot cached;
-            if (cache.TryGetValue(ip, out cached) && clock() - cached.CheckedUtc < TimeSpan.FromHours(24))
-                return new Snapshot { Ip = ip, CountryCode = cached.CountryCode, Country = cached.Country, Source = source, CheckedUtc = clock() };
-            var result = new Snapshot { Ip = ip, Source = source, CheckedUtc = clock() };
-            if (clock() < geoRetryUtc)
+            if (cache.TryGetValue(address.Ip, out cached) && clock() - cached.CheckedUtc < TimeSpan.FromHours(24))
+                return new Snapshot { Ip = address.Ip, CountryCode = cached.CountryCode, Country = cached.Country,
+                    Source = address.Source, CheckedUtc = clock() };
+            string escaped = Uri.EscapeDataString(address.Ip);
+            Snapshot country = await RaceAsync(new[] {
+                "https://ipwho.is/" + escaped + "?fields=ip,success,country,country_code,message",
+                "https://ipapi.co/" + escaped + "/json/"
+            }, address.Ip, systemProxy, token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            if (country == null)
             {
-                result.Error = "国家查询等待重试（" + geoRetryUtc.ToLocalTime().ToString("HH:mm:ss") + "）";
-                return result;
+                address.CheckedUtc = clock();
+                address.Error = "国家暂未识别，将快速重试（限流服务等待 Retry-After）";
+                return address;
             }
+            country.Source = address.Source;
+            country.CheckedUtc = clock();
+            if (cache.Count >= 256) cache.Clear();
+            cache[address.Ip] = country;
+            return country;
+        }
+
+        // Start a backup after 200 ms, or immediately on failure. Return the first valid
+        // response without waiting for losing requests or a transport that ignores cancellation.
+        private async Task<Snapshot> RaceAsync(string[] urls, string expectedIp, bool proxy, CancellationToken token)
+        {
+            using (var race = CancellationTokenSource.CreateLinkedTokenSource(token))
+            {
+                race.CancelAfter(StageTimeoutMilliseconds);
+                var pending = new List<Task<Snapshot>>();
+                Task canceled = Task.Delay(Timeout.Infinite, race.Token);
+                Task hedge = Task.Delay(HedgeMilliseconds, race.Token);
+                int next = 0;
+                try
+                {
+                    while (true)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        if (race.IsCancellationRequested) return null;
+                        if (next < urls.Length && (pending.Count == 0 || hedge.IsCompleted))
+                        {
+                            string url = urls[next++];
+                            string key = new Uri(url).Host;
+                            DateTime until;
+                            bool cooling;
+                            lock (cooldownLock) cooling = endpointCooldown.TryGetValue(key, out until) && clock() < until;
+                            if (cooling) continue;
+                            // HttpClient's proxy/DNS setup can execute synchronously on .NET Framework.
+                            CancellationToken attemptToken = race.Token;
+                            var task = Task.Run(() => AttemptAsync(url, expectedIp, proxy, attemptToken));
+                            ObserveFault(task);
+                            pending.Add(task);
+                            hedge = Task.Delay(HedgeMilliseconds, race.Token);
+                        }
+                        if (pending.Count == 0 && next == urls.Length) return null;
+                        var waits = new List<Task>();
+                        foreach (var task in pending) waits.Add(task);
+                        waits.Add(canceled);
+                        if (next < urls.Length) waits.Add(hedge);
+                        Task done = await Task.WhenAny(waits).ConfigureAwait(false);
+                        token.ThrowIfCancellationRequested();
+                        if (race.IsCancellationRequested) return null;
+                        var completed = done as Task<Snapshot>;
+                        if (completed == null) continue;
+                        pending.Remove(completed);
+                        Snapshot result = await completed.ConfigureAwait(false);
+                        if (result != null) return result;
+                        // A failed primary should not consume the hedge delay.
+                        hedge = Task.FromResult(0);
+                    }
+                }
+                finally { race.Cancel(); }
+            }
+        }
+
+        private static void ObserveFault(Task task)
+        {
+            task.ContinueWith(t => { t.Exception.Handle(ex => true); }, CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+
+        private async Task<Snapshot> AttemptAsync(string url, string expectedIp, bool proxy, CancellationToken token)
+        {
             try
             {
-                string json = await transport.GetAsync(GeoBase + Uri.EscapeDataString(ip) + "?fields=ip,success,country,country_code,message", systemProxy, token).ConfigureAwait(false);
+                string text = await transport.GetAsync(url, proxy, token).ConfigureAwait(false);
                 token.ThrowIfCancellationRequested();
-                result = Validation.CountryJson(json, ip);
-                result.CheckedUtc = clock();
-                result.Source = source;
-                if (cache.Count >= 256) cache.Clear();
-                cache[ip] = result;
+                if (expectedIp == null)
+                    return new Snapshot { Ip = Validation.PublicIp(text), Source = new Uri(url).Host };
+                return Validation.CountryJson(text, expectedIp, new Uri(url).Host == "ipapi.co");
             }
             catch (RateLimitException ex)
             {
-                geoRetryUtc = clock().Add(ex.RetryAfter);
-                result.Error = "国家查询限流，稍后自动重试";
+                // Cooldown belongs to the service, so one limited provider cannot block its backup.
+                Cooldown(url, ex.RetryAfter);
             }
             catch (OperationCanceledException)
             {
-                token.ThrowIfCancellationRequested();
-                geoRetryUtc = clock().AddMinutes(5);
-                result.Error = "国家查询超时，稍后自动重试";
+                if (!token.IsCancellationRequested && expectedIp != null) Cooldown(url, TimeSpan.FromSeconds(5));
             }
             catch (Exception ex)
             {
-                if (!(ex is HttpRequestException || ex is FormatException || ex is ArgumentException || ex is InvalidOperationException)) throw;
-                geoRetryUtc = clock().AddMinutes(5);
-                result.Error = "国家暂时无法识别，5 分钟后自动重试";
+                if (!(ex is HttpRequestException || ex is WebException || ex is FormatException ||
+                    ex is ArgumentException || ex is InvalidOperationException)) throw;
+                if (!token.IsCancellationRequested && expectedIp != null) Cooldown(url, TimeSpan.FromSeconds(5));
             }
-            return result;
+            return null;
+        }
+
+        private void Cooldown(string url, TimeSpan delay)
+        {
+            lock (cooldownLock) endpointCooldown[new Uri(url).Host] = clock().Add(delay);
         }
     }
-
     // Generation tokens prevent a request started before a network change overwriting newer state.
     internal sealed class RefreshSchedule
     {
