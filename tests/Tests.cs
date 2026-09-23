@@ -39,11 +39,12 @@ namespace IPCountryWatcher
     internal sealed class RetryLookup : ILookup
     {
         public int Calls;
+        public bool Stale;
         public Task<Snapshot> QueryAsync(bool proxy, CancellationToken token)
         {
             int call = Interlocked.Increment(ref Calls);
-            return Task.FromResult(new Snapshot { Ip = "8.8.8.8", CountryCode = call > 1 ? "US" : null,
-                Country = call > 1 ? "美国" : null, CheckedUtc = DateTime.UtcNow });
+            return Task.FromResult(new Snapshot { Ip = "8.8.8.8", CountryCode = call > 1 || Stale ? "US" : null,
+                Country = call > 1 || Stale ? "美国" : null, CountryIsStale = Stale && call == 1, CheckedUtc = DateTime.UtcNow });
         }
     }
     internal static partial class Tests
@@ -73,11 +74,16 @@ namespace IPCountryWatcher
                 { Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false); ProcessWindowTest(); return failures == 0 ? 0 : 1; }
                 ProcessTests().GetAwaiter().GetResult();
                 CoreTests().GetAwaiter().GetResult();
+                CountryCacheResilienceTests().GetAwaiter().GetResult();
+                TrayDisplayStateTests();
                 LatencyTests().GetAwaiter().GetResult();
                 IconTests();
                 SmokeTest();
                 TrayLatencyTest();
                 TrayRetryTest();
+                TrayRetryTest(true);
+                TrayFailureRetryTest();
+                TrayRetentionExpiryTest();
                 ProcessWindowTest();
             }
             catch (Exception ex) { Check("Unhandled exception: " + ex, false); }
@@ -319,9 +325,9 @@ namespace IPCountryWatcher
             Check("Real tray shows backup flag in " + visibleMs + " ms despite stuck primary", visibleMs >= 0 && visibleMs < 1500);
             Check("Country response to visible tray takes " + (visibleMs - responseMs) + " ms", responseMs >= 0 && visibleMs >= responseMs && visibleMs - responseMs < 250);
         }
-        private static void TrayRetryTest()
+        private static void TrayRetryTest(bool stale = false)
         {
-            var lookup = new RetryLookup();
+            var lookup = new RetryLookup { Stale = stale };
             var watch = Stopwatch.StartNew();
             var context = new TrayContext(lookup, new Settings { PollSeconds = 60, NotifyOnChange = false }, true);
             bool sawUnknown = false;
@@ -330,15 +336,16 @@ namespace IPCountryWatcher
             {
                 timer.Tick += (sender, args) =>
                 {
-                    if (context.Current != null && context.Current.HasIp && !context.Current.HasCountry) sawUnknown = true;
-                    if (context.VisibleCountry == "US") recoveredMs = watch.ElapsedMilliseconds;
+                    if (context.Current != null && context.Current.HasIp && (!context.Current.HasCountry || context.Current.CountryIsStale))
+                        sawUnknown = !stale || (context.VisibleCountry == "US" && context.TooltipText.Contains("缓存待更新"));
+                    if (context.VisibleCountry == "US" && !context.Current.CountryIsStale) recoveredMs = watch.ElapsedMilliseconds;
                     if (recoveredMs >= 0 || watch.ElapsedMilliseconds > 6500) { timer.Stop(); context.ExitThread(); }
                 };
                 timer.Start();
                 Application.Run(context);
             }
             context.Dispose();
-            Check("60-second polling still retries unknown country in " + recoveredMs + " ms",
+            Check("60-second polling still retries " + (stale ? "stale cached" : "unknown") + " country in " + recoveredMs + " ms",
                 sawUnknown && lookup.Calls == 2 && recoveredMs >= 4500 && recoveredMs < 6500);
         }
         private static void IconTests()
