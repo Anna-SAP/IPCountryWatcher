@@ -103,6 +103,7 @@ namespace IPCountryWatcher
         private void AddRow(ProcessMonitorRow row, Snapshot address, string family, string status, bool fresh)
         {
             string country = address == null ? "—" : address.HasCountry ? address.Country + " (" + address.CountryCode + ")" : "国家暂未识别";
+            if (address != null && address.CountryIsStale) country += " · 缓存待更新";
             string familyError = family == "IPv4" ? row.Error4 : row.Error6;
             if (fresh && address == null && !String.IsNullOrEmpty(familyError)) status = familyError;
             int index = grid.Rows.Add(row.Application.Name, row.Identity == null ? "—" : row.Identity.Pid.ToString(), family,

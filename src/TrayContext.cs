@@ -31,19 +31,26 @@ namespace IPCountryWatcher
         private ProcessMonitorForm processForm;
         private Icon ownedIcon;
         private string iconCode = "#";
-        private Snapshot current;
+        private readonly TrayDisplayState displayState = new TrayDisplayState();
+        private readonly Func<DateTime> clock;
+        private Snapshot current { get { return displayState.Current; } }
+        private string status = "正在启动";
         private Snapshot lastKnown;
         private CancellationTokenSource activeRequest;
         private int failures;
         private volatile bool closing;
         internal string VisibleCountry { get { return iconCode; } }
         internal Snapshot Current { get { return current; } }
+        internal string StatusText { get { return statusItem.Text; } }
+        internal string TooltipText { get { return tray.Text; } }
+        internal bool CanCopyIp { get { return copyItem.Enabled; } }
 
-        public TrayContext(ILookup lookup, Settings settings, bool testing)
+        public TrayContext(ILookup lookup, Settings settings, bool testing, Func<DateTime> clock = null)
         {
             this.lookup = lookup;
             this.settings = settings;
             this.testing = testing;
+            this.clock = clock ?? (() => DateTime.UtcNow);
             IntPtr handle = dispatcher.Handle;
             title.Enabled = ipItem.Enabled = countryItem.Enabled = statusItem.Enabled = timeItem.Enabled = false;
             copyItem.Enabled = false;
@@ -71,7 +78,7 @@ namespace IPCountryWatcher
             menu.Items.Add(processesItem);
             menu.Items.Add("监控应用设置…", null, (s, e) => EditApplications());
             var proxy = new ToolStripMenuItem("跟随 Windows 系统代理") { Checked = settings.UseSystemProxy, CheckOnClick = true };
-            proxy.Click += (s, e) => { settings.UseSystemProxy = proxy.Checked; SaveSettings(); RequestRefresh(); };
+            proxy.Click += (s, e) => { settings.UseSystemProxy = proxy.Checked; SaveSettings(); RequestRefresh(true); };
             menu.Items.Add(proxy);
             var notify = new ToolStripMenuItem("IP 变化时通知") { Checked = settings.NotifyOnChange, CheckOnClick = true };
             notify.Click += (s, e) => { settings.NotifyOnChange = notify.Checked; SaveSettings(); };
@@ -159,50 +166,54 @@ namespace IPCountryWatcher
         }
 
         private void NetworkChanged(object sender, EventArgs args) { PostRefresh(); }
-        private void AvailabilityChanged(object sender, NetworkAvailabilityEventArgs args) { PostRefresh(); }
+        private void AvailabilityChanged(object sender, NetworkAvailabilityEventArgs args) { PostRefresh(!args.IsAvailable); }
         private void PowerChanged(object sender, PowerModeChangedEventArgs args)
-        { if (args.Mode == PowerModes.Resume) PostRefresh(); }
+        { if (args.Mode == PowerModes.Resume) PostRefresh(true); }
 
-        private void PostRefresh()
+        private void PostRefresh(bool clearPrevious = false)
         {
             if (closing) return;
-            try { dispatcher.BeginInvoke((Action)(() => RequestRefresh(TimeSpan.FromMilliseconds(200)))); }
+            try { dispatcher.BeginInvoke((Action)(() => RequestRefresh(TimeSpan.FromMilliseconds(200), clearPrevious))); }
             catch (InvalidOperationException) { /* Dispatcher is closing. */ }
         }
 
         internal void RequestRefresh()
-        { RequestRefresh(TimeSpan.Zero); }
+        { RequestRefresh(false); }
 
-        private void RequestRefresh(TimeSpan debounce)
+        internal void RequestRefresh(bool clearPrevious)
+        { RequestRefresh(TimeSpan.Zero, clearPrevious); }
+
+        private void RequestRefresh(TimeSpan debounce, bool clearPrevious)
         {
             if (closing) return;
-            schedule.Request(DateTime.UtcNow, debounce);
+            schedule.Request(clock(), debounce);
+            failures = 0;
             if (processMonitor != null) processMonitor.Invalidate();
             if (activeRequest != null) activeRequest.Cancel();
-            current = null;
-            copyItem.Enabled = false;
-            SetIcon(null);
-            statusItem.Text = "正在重新确认网络出口…";
-            ipItem.Text = "本程序公网 IP：正在查询…";
-            countryItem.Text = "国家 / 地区：待识别";
-            tray.Text = "IP 国旗监视器 · 正在重新查询";
+            displayState.Invalidate(clearPrevious);
+            status = "正在重新确认网络出口…";
+            RenderState();
             if (debounce == TimeSpan.Zero) Tick(null, EventArgs.Empty);
         }
 
         private async void Tick(object sender, EventArgs args)
         {
             if (closing) return;
-            int generation = schedule.Begin(DateTime.UtcNow);
+            // Expire a retained flag even while a request or the retry timer is pending.
+            if (iconCode != null && (current == null || !current.HasCountry) && displayState.Displayed(clock()) == null)
+                RenderState();
+            int generation = schedule.Begin(clock());
             if (generation < 0) return;
             activeRequest = new CancellationTokenSource();
             var request = activeRequest;
             bool useProxy = settings.UseSystemProxy;
-            statusItem.Text = "正在检查…";
+            status = "正在检查…";
+            RenderState();
             try
             {
                 var result = await Task.Run(() => lookup.QueryAsync(useProxy, request.Token));
                 if (closing || !schedule.IsCurrent(generation)) return;
-                failures = result.HasIp ? 0 : Math.Min(4, failures + 1);
+                failures = result.HasIp ? 0 : Math.Min(5, failures + 1);
                 Apply(result);
             }
             catch (OperationCanceledException) { }
@@ -210,34 +221,28 @@ namespace IPCountryWatcher
             {
                 if (!closing && schedule.IsCurrent(generation))
                 {
-                    failures = Math.Min(4, failures + 1);
-                    Apply(new Snapshot { Error = "查询发生异常，稍后自动重试", CheckedUtc = DateTime.UtcNow });
+                    failures = Math.Min(5, failures + 1);
+                    Apply(new Snapshot { Error = "查询发生异常，稍后自动重试", CheckedUtc = clock() });
                 }
             }
             finally
             {
                 activeRequest = null;
                 request.Dispose();
-                double seconds = Math.Min(60, settings.PollSeconds * Math.Pow(2, failures));
+                // The first failed check should recover promptly, even with 60-second polling.
+                double seconds = failures == 0 ? settings.PollSeconds : Math.Min(60, 5 * Math.Pow(2, failures - 1));
                 // An unresolved country must not wait for a long user-selected IP polling interval.
-                if (current != null && current.HasIp && !current.HasCountry) seconds = Math.Min(5, seconds);
-                schedule.Complete(generation, DateTime.UtcNow, TimeSpan.FromSeconds(seconds));
+                if (current != null && current.HasIp && (!current.HasCountry || current.CountryIsStale)) seconds = Math.Min(5, seconds);
+                schedule.Complete(generation, clock(), TimeSpan.FromSeconds(seconds));
             }
         }
 
         private void Apply(Snapshot result)
         {
             Snapshot previous = lastKnown;
-            current = result;
-            SetIcon(result.CountryCode);
-            ipItem.Text = "本程序公网 IP：" + (result.Ip ?? "无法获取");
-            countryItem.Text = "国家 / 地区：" + (result.HasCountry ? result.Country + " (" + result.CountryCode + ")" : "暂未识别");
-            statusItem.Text = result.Error ?? "监控中 · " + result.Source;
-            timeItem.Text = "检查时间：" + result.CheckedUtc.ToLocalTime().ToString("HH:mm:ss");
-            copyItem.Enabled = result.HasIp;
-            string tooltip = result.HasCountry ? result.CountryCode + " · " + result.Ip :
-                result.HasIp ? "国家待识别 · " + result.Ip : "网络未确认 · 等待重试";
-            tray.Text = tooltip.Length > 63 ? tooltip.Substring(0, 63) : tooltip;
+            displayState.Accept(result);
+            status = result.Error ?? "监控中 · " + result.Source;
+            RenderState();
             if (result.HasIp)
             {
                 if (!testing && settings.NotifyOnChange && previous != null && previous.Ip != result.Ip)
@@ -247,6 +252,26 @@ namespace IPCountryWatcher
                 }
                 lastKnown = result;
             }
+        }
+
+        private void RenderState()
+        {
+            Snapshot shown = displayState.Displayed(clock());
+            bool retained = shown != null && shown != current;
+            SetIcon(shown == null ? null : shown.CountryCode);
+            ipItem.Text = retained ? "上次确认 IP（待复核）：" + shown.Ip :
+                "本程序公网 IP：" + (current == null ? "正在查询…" : current.Ip ?? "无法获取");
+            countryItem.Text = (retained ? "上次国家 / 地区：" : "国家 / 地区：") +
+                (shown == null ? "暂未识别" : shown.Country + " (" + shown.CountryCode + ")" +
+                (shown.CountryIsStale ? " · 缓存待更新" : ""));
+            statusItem.Text = status + (retained ? " · 暂留上次国旗（最多 2 分钟）" : "");
+            timeItem.Text = retained ? "上次确认：" + shown.CheckedUtc.ToLocalTime().ToString("HH:mm:ss") :
+                current == null ? "尚未完成本次查询" : "检查时间：" + current.CheckedUtc.ToLocalTime().ToString("HH:mm:ss");
+            copyItem.Enabled = current != null && current.HasIp;
+            string tooltip = retained ? "待确认 · 上次 " + shown.CountryCode + " · " + shown.Ip :
+                shown != null ? (shown.CountryIsStale ? "国家缓存待更新 · " : "") + shown.CountryCode + " · " + shown.Ip :
+                current != null && current.HasIp ? "国家待识别 · " + current.Ip : "网络未确认 · 等待重试";
+            tray.Text = tooltip.Length > 63 ? tooltip.Substring(0, 63) : tooltip;
         }
 
         private void CopyIp()

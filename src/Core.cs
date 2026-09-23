@@ -18,6 +18,7 @@ namespace IPCountryWatcher
         public string Source;
         public string Error;
         public DateTime CheckedUtc;
+        public bool CountryIsStale;
         public bool HasIp { get { return !String.IsNullOrEmpty(Ip); } }
         public bool HasCountry { get { return !String.IsNullOrEmpty(CountryCode); } }
     }
@@ -137,6 +138,8 @@ namespace IPCountryWatcher
         private readonly object cooldownLock = new object();
         internal const int HedgeMilliseconds = 200;
         internal const int StageTimeoutMilliseconds = 4000;
+        internal static readonly TimeSpan CountryCacheLifetime = TimeSpan.FromHours(24);
+        internal static readonly TimeSpan CountryCacheFallbackLifetime = TimeSpan.FromDays(7);
         internal static readonly string[] IpUrls = { "https://api.ipify.org", "https://checkip.amazonaws.com", "https://api64.ipify.org" };
 
         public LookupService(ITransport transport, Func<DateTime> clock)
@@ -161,7 +164,8 @@ namespace IPCountryWatcher
             var address = new Snapshot { Ip = Validation.PublicIp(ip), Source = source };
             token.ThrowIfCancellationRequested();
             Snapshot cached;
-            if (cache.TryGetValue(address.Ip, out cached) && clock() - cached.CheckedUtc < TimeSpan.FromHours(24))
+            if (cache.TryGetValue(address.Ip, out cached) && clock() >= cached.CheckedUtc &&
+                clock() - cached.CheckedUtc < CountryCacheLifetime)
                 return new Snapshot { Ip = address.Ip, CountryCode = cached.CountryCode, Country = cached.Country,
                     Source = address.Source, CheckedUtc = clock() };
             string escaped = Uri.EscapeDataString(address.Ip);
@@ -173,6 +177,17 @@ namespace IPCountryWatcher
             if (country == null)
             {
                 address.CheckedUtc = clock();
+                // Only reuse the exact IP's country, with a hard age limit. Do not renew
+                // the cache timestamp on failure, or repeated outages would extend it forever.
+                if (cached != null && address.CheckedUtc >= cached.CheckedUtc &&
+                    address.CheckedUtc - cached.CheckedUtc < CountryCacheFallbackLifetime)
+                {
+                    address.CountryCode = cached.CountryCode;
+                    address.Country = cached.Country;
+                    address.CountryIsStale = true;
+                    address.Error = "公网 IP 已确认 · 国家服务暂不可用，沿用同一 IP 的缓存并重试";
+                    return address;
+                }
                 address.Error = "国家暂未识别，将快速重试（限流服务等待 Retry-After）";
                 return address;
             }
