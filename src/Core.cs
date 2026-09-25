@@ -101,6 +101,14 @@ namespace IPCountryWatcher
             return address.ToString();
         }
 
+        // Plain-text services return only the address; Cloudflare's /cdn-cgi/trace returns key=value lines.
+        public static string ResponseIp(string body)
+        {
+            foreach (string line in (body ?? "").Split('\n'))
+                if (line.StartsWith("ip=", StringComparison.Ordinal)) return PublicIp(line.Substring(3));
+            return PublicIp(body);
+        }
+
         public static Snapshot CountryJson(string json, string expectedIp)
         { return CountryJson(json, expectedIp, false); }
 
@@ -140,7 +148,16 @@ namespace IPCountryWatcher
         internal const int StageTimeoutMilliseconds = 4000;
         internal static readonly TimeSpan CountryCacheLifetime = TimeSpan.FromHours(24);
         internal static readonly TimeSpan CountryCacheFallbackLifetime = TimeSpan.FromDays(7);
-        internal static readonly string[] IpUrls = { "https://api.ipify.org", "https://checkip.amazonaws.com", "https://api64.ipify.org" };
+        // Sources must report the TCP peer. HTTPS-inspecting proxies such as Zscaler insert X-Forwarded-For
+        // with the pre-proxy address, and services that trust it (ipify) report that instead of the egress.
+        // Both IPv4 URLs share one Cloudflare host so policy-routed networks send them through one egress.
+        internal static readonly string[] IpUrls = { "https://ipv4.icanhazip.com", "https://ipv4.icanhazip.com/cdn-cgi/trace", "https://ifconfig.me/ip" };
+
+        internal static string SourceName(string url)
+        {
+            var uri = new Uri(url);
+            return uri.AbsolutePath == "/" ? uri.Host : uri.Host + uri.AbsolutePath;
+        }
 
         public LookupService(ITransport transport, Func<DateTime> clock)
         { this.transport = transport; this.clock = clock; }
@@ -264,7 +281,7 @@ namespace IPCountryWatcher
                 string text = await transport.GetAsync(url, proxy, token).ConfigureAwait(false);
                 token.ThrowIfCancellationRequested();
                 if (expectedIp == null)
-                    return new Snapshot { Ip = Validation.PublicIp(text), Source = new Uri(url).Host };
+                    return new Snapshot { Ip = Validation.ResponseIp(text), Source = SourceName(url) };
                 return Validation.CountryJson(text, expectedIp, new Uri(url).Host == "ipapi.co");
             }
             catch (RateLimitException ex)

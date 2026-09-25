@@ -33,7 +33,8 @@
 
 默认跟随 Windows 系统代理；取消该项后使用本机路由直接发出请求（VPN/TUN 仍可能影响路由）。
 每轮重新获取代理配置。浏览器插件、应用专用 SOCKS 代理及按域名分流可能产生不同出口，显示结果仅代表本程序查询服务看到的出口。
-优先查询公网 IPv4（api.ipify.org，慢于 200 毫秒或失败时并发启动 checkip.amazonaws.com，采用最先验证成功的结果）；两者失败或达到本组超时后才使用 api64.ipify.org 尝试 IPv4/IPv6。按域名分流时，这两个 IPv4 服务也可能看到不同出口。
+优先查询公网 IPv4（ipv4.icanhazip.com，慢于 200 毫秒或失败时并发请求同一主机的 Cloudflare /cdn-cgi/trace，采用最先验证成功的结果）；两者失败或达到本组超时后才使用 ifconfig.me 尝试 IPv4/IPv6。
+查询服务均按 TCP 连接的来源地址返回 IP，不采信 X-Forwarded-For。Zscaler 等解密 HTTPS 的代理会在请求中插入该头并写入代理前的本机公网 IP，ipify 等采信该头的服务因此报告代理前的地址，而不是网站实际看到的出口。公司代理还可能按目标网站选择不同出口：两个 IPv4 查询共用同一 Cloudflare 主机，经过同一出口，结果代表 Cloudflare 上的网站看到的出口；备用的 ifconfig.me 位于 Google Cloud，可能看到另一个出口。
 托盘顶部仅展示本程序的一个当前出口；进程监控窗口独立列出目标进程的双栈结果。切换到 IPv6 备用查询源也可能表现为 IP 变化。
 
 ## 进程 IP 监控（VPN 分流 / 代理绕过）
@@ -50,7 +51,7 @@
 
 仅查询 Windows TCP 表只能得到本地端点、对端和所属 PID；本地网卡地址、服务器 IP 或 VPN 路由本身无法证明 NAT / 代理后的公网出口。此功能由配套的 x86/x64 DLL 在目标进程中请求固定 HTTPS 地址，并将结果通过该进程的内存回传给监视器。国家查询由监视器针对这个明确 IP 进行，复用缓存、超时与限流处理，不以监视器自己的出口替代。
 
-IPv4 使用 api.ipify.org，失败后尝试 checkip.amazonaws.com；IPv6 独立使用 api6.ipify.org。界面保留实际获胜查询源。IPv6 不可用不会抹掉有效 IPv4，反之亦然。结果代表**这个 PID 在所选探针模式下访问测试服务时的出口**，不承诺目标应用访问所有网站、UDP/QUIC、内置代理或其它联网子进程都使用相同出口。共享 WebView、Python 等宿主需自行选择实际联网 EXE；不会自动把其它程序的共享宿主归到某个应用。
+IPv4 使用 ipv4.icanhazip.com，失败后尝试同一主机的 /cdn-cgi/trace；IPv6 独立使用 ipv6.icanhazip.com，均按 TCP 连接的来源地址返回 IP。界面保留实际获胜查询源。IPv6 不可用不会抹掉有效 IPv4，反之亦然。结果代表**这个 PID 在所选探针模式下访问测试服务时的出口**，不承诺目标应用访问所有网站、UDP/QUIC、内置代理或其它联网子进程都使用相同出口。共享 WebView、Python 等宿主需自行选择实际联网 EXE；不会自动把其它程序的共享宿主归到某个应用。
 
 进程内加载可能被 DRM、反作弊、沙箱、受保护进程或权限隔离拦截，也可能影响兼容性。探针只允许同一 Windows 用户和会话，不申请调试特权、不提权、不绕过应用保护；访问拒绝会显示原因。当前支持 x64 Windows 上的 x86/x64 进程。加载超时等不可恢复错误在该进程本次生命周期内停止自动重试。
 
@@ -75,7 +76,7 @@ IPv4 使用 api.ipify.org，失败后尝试 checkip.amazonaws.com；IPv6 独立�
 
 ## 网络与本地数据
 
-运行程序会向 ipify / AWS checkip 发起 HTTPS 请求以查询本机公网 IP，向 ipwho.is / ipapi.co 提交该 IP 查询国家；这些服务会获知请求来源的公网 IP。
+运行程序会向 icanhazip（Cloudflare）/ ifconfig.me 发起 HTTPS 请求以查询本机公网 IP，向 ipwho.is / ipapi.co 提交该 IP 查询国家；这些服务会获知请求来源的公网 IP。
 所有查询使用 HTTPS；不发送姓名、设备名、本机私有 IP 或浏览历史。未添加遥测和 IP 历史文件。
 设置（含所选应用名称、EXE 路径、启用状态和探针模式）保存至 %LOCALAPPDATA%/IPCountryWatcher/settings.json。进程列表和测量结果只保留在内存，未发送给查询服务；公网查询只发送必要的 IP 请求。国家缓存仅在进程内。
 服务需要互联网访问；未配置付费密钥，免费服务限流或不可用时程序会显示状态并自动重试。
@@ -134,7 +135,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Test -Installer
 ## 官方资料
 
 - Windows 网络地址事件：https://learn.microsoft.com/en-us/dotnet/api/system.net.networkinformation.networkchange
-- ipify 接口：https://www.ipify.org/
+- icanhazip 说明：https://major.io/icanhazip-com-faq/
+- Cloudflare /cdn-cgi/trace：https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/
+- ifconfig.me 接口：https://ifconfig.me/
 - 国家查询字段与限流：https://ipwhois.io/documentation
 - 备用国家查询：https://ipapi.co/api/
 - 国旗资源：https://flagpedia.net/download/api

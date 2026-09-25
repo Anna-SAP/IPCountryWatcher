@@ -31,6 +31,10 @@ namespace IPCountryWatcher
 
     internal sealed class NativeProcessProbe : IProcessProbe
     {
+        // Labels for the hosts and paths queried by native/ProbeDll.cpp; source4 1/2 selects the IPv4 entry.
+        internal static readonly string[] Sources4 = { "ipv4.icanhazip.com", "ipv4.icanhazip.com/cdn-cgi/trace" };
+        internal const string Source6 = "ipv6.icanhazip.com";
+
         private sealed class WireResult
         {
             public int pid { get; set; }
@@ -94,7 +98,7 @@ namespace IPCountryWatcher
                         return result;
                     }
                     if (wire.pid != identity.Pid || !identity.IsAlive()) throw new InvalidOperationException("进程已变更，丢弃旧结果");
-                    result.Source4 = wire.source4 == 2 ? "checkip.amazonaws.com" : "api.ipify.org";
+                    result.Source4 = Sources4[wire.source4 == 2 ? 1 : 0];
                     result.Ip4 = ReadIp(wire.ip4, AddressFamily.InterNetwork);
                     result.Ip6 = ReadIp(wire.ip6, AddressFamily.InterNetworkV6);
                     result.Error4 = String.IsNullOrEmpty(result.Ip4) ? DescribeNetworkError(wire.error4) : null;

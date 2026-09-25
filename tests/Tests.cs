@@ -64,6 +64,8 @@ namespace IPCountryWatcher
         }
         private static string Geo(string ip, string code)
         { return "{\"success\":true,\"ip\":\"" + ip + "\",\"country_code\":\"" + code + "\",\"country\":\"Test\"}"; }
+        private static string Trace(string ip)
+        { return "fl=467f1\nh=ipv4.icanhazip.com\nip=" + ip + "\nts=1790000000.123\nvisit_scheme=https\ncolo=SIN\nloc=SG\n"; }
 
         [STAThread]
         private static int Main(string[] args)
@@ -100,6 +102,11 @@ namespace IPCountryWatcher
             foreach (string ip in new[] { "127.0.0.1", "10.1.2.3", "192.168.1.1", "172.16.0.1", "169.254.2.1",
                 "100.64.1.1", "::1", "fe80::1", "fc00::1", "0.0.0.0", "255.255.255.255", "203.0.113.5", "2001:db8::1", "123", "<html>error</html>" })
                 Reject("Reject non-public IP " + ip, () => Validation.PublicIp(ip));
+            Check("Plain-text IP response", Validation.ResponseIp("8.8.8.8\n") == "8.8.8.8");
+            Check("Cloudflare trace IP response", Validation.ResponseIp(Trace("8.8.8.8")) == "8.8.8.8" &&
+                Validation.ResponseIp(Trace("2606:4700:4700::1111").Replace("\n", "\r\n")) == "2606:4700:4700::1111");
+            Reject("Reject non-public trace IP", () => Validation.ResponseIp(Trace("10.1.2.3")));
+            Reject("Reject trace without IP", () => Validation.ResponseIp("fl=467f1\nloc=SG\n"));
             Check("Country parsing", Validation.CountryJson(Geo("8.8.8.8", "us"), "8.8.8.8").CountryCode == "US");
             Reject("Reject mismatched country IP", () => Validation.CountryJson(Geo("1.1.1.1", "AU"), "8.8.8.8"));
             Reject("Reject API success false", () => Validation.CountryJson("{\"success\":false}", "8.8.8.8"));
@@ -144,12 +151,13 @@ namespace IPCountryWatcher
             transport.Handler = (url, token) =>
             {
                 if (url == LookupService.IpUrls[0]) throw new HttpRequestException("primary down");
+                if (url == LookupService.IpUrls[1]) return Task.FromResult(Trace("1.1.1.1"));
                 if (url.StartsWith("https://ipwho.is/")) return Task.FromResult(Geo("1.1.1.1", "AU"));
                 return Task.FromResult("1.1.1.1");
             };
             service = new LookupService(transport, () => now);
             Snapshot fallback = await service.QueryAsync(false, CancellationToken.None);
-            Check("IP service failover", fallback.Source == "checkip.amazonaws.com" && fallback.HasCountry);
+            Check("IP service failover", fallback.Source == "ipv4.icanhazip.com/cdn-cgi/trace" && fallback.Ip == "1.1.1.1" && fallback.HasCountry);
             transport.Handler = (url, token) => { throw new HttpRequestException("offline"); };
             Snapshot offline = await service.QueryAsync(false, CancellationToken.None);
             Check("All endpoints down clears current IP and flag", !offline.HasIp && !offline.HasCountry && offline.Error != null);
@@ -226,7 +234,7 @@ namespace IPCountryWatcher
             var watch = Stopwatch.StartNew();
             Snapshot result = await service.QueryAsync(true, CancellationToken.None);
             Check("Slow IP and geo primaries bypassed in " + watch.ElapsedMilliseconds + " ms",
-                result.CountryCode == "US" && result.Source == "checkip.amazonaws.com" && watch.ElapsedMilliseconds < 1500);
+                result.CountryCode == "US" && result.Source == "ipv4.icanhazip.com/cdn-cgi/trace" && watch.ElapsedMilliseconds < 1500);
             Check("Losing requests canceled without waiting for completion", canceledLosers == 2 && !slowIp.Task.IsCompleted && !slowGeo.Task.IsCompleted);
             Check("Healthy IPv4 avoids IPv6 fallback", !transport.Calls.Contains(LookupService.IpUrls[2]));
             slowIp.SetResult("1.1.1.1");
