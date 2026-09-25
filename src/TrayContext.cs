@@ -88,7 +88,7 @@ namespace IPCountryWatcher
             menu.Items.Add(startupItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("关于", null, (s, e) => MessageBox.Show(
-                "IP 国旗监视器 " + Application.ProductVersion + "\n\n网络变化时自动检查，定时轮询公网出口。\n灰色地球表示正在查询或结果未确认。\n\nIP：ipify / AWS checkip\n国家：ipwho.is / ipapi.co\n国旗：Flagpedia.net / flagcdn.com（已内嵌）\n\n这些查询服务会获知请求的公网 IP。\n显示的是本程序请求所经过的出口，分流代理下\n可能与浏览器或其他应用不同。\n\n双击图标可立即刷新；右键打开菜单。",
+                "IP 国旗监视器 " + Application.ProductVersion + "\n\n网络变化时自动检查，定时轮询公网出口。\n灰色地球表示正在查询或结果未确认。\n\nIP：icanhazip / Cloudflare trace / ifconfig.me\n国家：ipwho.is / ipapi.co\n国旗：Flagpedia.net / flagcdn.com（已内嵌）\n\n这些查询服务会获知请求的公网 IP。\n显示的是本程序请求所经过的出口，分流代理下\n可能与浏览器或其他应用不同。\n\n双击图标可立即刷新；右键打开菜单。",
                 "关于 IP 国旗监视器", MessageBoxButtons.OK, MessageBoxIcon.Information));
             menu.Items.Add("退出", null, (s, e) => ExitThread());
             tray.ContextMenuStrip = menu;

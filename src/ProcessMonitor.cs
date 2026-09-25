@@ -142,13 +142,13 @@ namespace IPCountryWatcher
                 if (!String.IsNullOrEmpty(measured.Error)) return;
                 // Publish the real IP immediately; geolocation may be temporarily unavailable.
                 if (measured.Ip4 != null) row.V4 = new Snapshot { Ip = measured.Ip4, Source = measured.Source4 };
-                if (measured.Ip6 != null) row.V6 = new Snapshot { Ip = measured.Ip6, Source = "api6.ipify.org" };
+                if (measured.Ip6 != null) row.V6 = new Snapshot { Ip = measured.Ip6, Source = NativeProcessProbe.Source6 };
                 row.Status = row.V4 != null || row.V6 != null ? "进程内实测 · 国家解析中" : "出口未确认";
                 await geoSlot.WaitAsync(token);
                 try
                 {
-                    if (row.V4 != null) row.V4 = await geo.ResolveCountryAsync(measured.Ip4, geoProxy, token, measured.Source4 ?? "api.ipify.org");
-                    if (row.V6 != null) row.V6 = await geo.ResolveCountryAsync(measured.Ip6, geoProxy, token, "api6.ipify.org");
+                    if (row.V4 != null) row.V4 = await geo.ResolveCountryAsync(measured.Ip4, geoProxy, token, measured.Source4 ?? NativeProcessProbe.Sources4[0]);
+                    if (row.V6 != null) row.V6 = await geo.ResolveCountryAsync(measured.Ip6, geoProxy, token, NativeProcessProbe.Source6);
                 }
                 finally { geoSlot.Release(); }
                 if (disposed || generation != Generation) return;

@@ -103,10 +103,10 @@ namespace IPCountryWatcher
                 Check("Network change discards late native result even if it ignores cancellation",
                     monitor.Rows.All(r => r.V4 == null || !r.IsFresh(DateTime.UtcNow, monitor.Generation)));
                 fake.Handler = (identity, token) => Task.FromResult(new ProcessProbeResult {
-                    Identity = identity, Source4 = "checkip.amazonaws.com", Ip4 = "8.8.8.8", Error6 = "No IPv6", CheckedUtc = DateTime.UtcNow });
+                    Identity = identity, Source4 = NativeProcessProbe.Sources4[1], Ip4 = "8.8.8.8", Error6 = "No IPv6", CheckedUtc = DateTime.UtcNow });
                 await monitor.PollAsync();
                 Check("Fresh process result and country reach monitor after invalidation",
-                    monitor.Rows[0].V4 != null && monitor.Rows[0].V4.CountryCode == "US" && monitor.Rows[0].V4.Source == "checkip.amazonaws.com" && monitor.Rows[0].Error6 == "No IPv6");
+                    monitor.Rows[0].V4 != null && monitor.Rows[0].V4.CountryCode == "US" && monitor.Rows[0].V4.Source == NativeProcessProbe.Sources4[1] && monitor.Rows[0].Error6 == "No IPv6");
                 var row = monitor.Rows[0];
                 Check("Old measurements become stale after 90 seconds", !row.IsFresh(row.CheckedUtc.AddSeconds(91), monitor.Generation));
                 appConfig.Enabled = false;
@@ -163,7 +163,7 @@ namespace IPCountryWatcher
                 monitor.Rows[0] = new ProcessMonitorRow {
                     Application = new MonitoredApplication { Name = "爱奇艺（测试数据）", Enabled = true, ExecutablePath = self.Path },
                     Identity = self, Key = "test", CheckedUtc = DateTime.UtcNow, Status = "进程内实测",
-                    V4 = new Snapshot { Ip = "8.8.8.8", CountryCode = "US", Country = "美国", Source = "api.ipify.org" },
+                    V4 = new Snapshot { Ip = "8.8.8.8", CountryCode = "US", Country = "美国", Source = NativeProcessProbe.Sources4[0] },
                     Error6 = "此地址族不可用", LocalAddresses = "192.168.1.2 [测试网卡]" };
                 using (var form = new ProcessMonitorForm(monitor, () => new Snapshot { Ip = "1.1.1.1", Country = "测试国家" }, () => { }, () => { }, true))
                 {
