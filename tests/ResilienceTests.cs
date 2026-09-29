@@ -48,6 +48,27 @@ namespace IPCountryWatcher
             Check("Confirmed country change is displayed immediately", state.Displayed(now.AddSeconds(6)) == next);
         }
 
+        private static void CountryChangeTrackerTests()
+        {
+            DateTime now = new DateTime(2026, 9, 29, 0, 0, 0, DateTimeKind.Utc);
+            var tracker = new CountryChangeTracker();
+            Check("First confirmed country is a baseline, not a change notification", tracker.Observe(Confirmed(now)) == null);
+            var sameCountry = new Snapshot { Ip = "1.1.1.1", CountryCode = "SG", Country = "新加坡", CheckedUtc = now.AddSeconds(5) };
+            Check("New IP in the same country does not notify", tracker.Observe(sameCountry) == null);
+            Check("Failures and a new unresolved IP defer the comparison",
+                tracker.Observe(new Snapshot { Error = "timeout", CheckedUtc = now.AddSeconds(10) }) == null &&
+                tracker.Observe(new Snapshot { Ip = "9.9.9.9", CheckedUtc = now.AddSeconds(15) }) == null);
+            var changed = new Snapshot { Ip = "9.9.9.9", CountryCode = "JP", Country = "日本", CheckedUtc = now.AddSeconds(20) };
+            Check("Country resolved later is compared with the last confirmed country", tracker.Observe(changed) == sameCountry);
+            Check("Unchanged country does not notify again",
+                tracker.Observe(new Snapshot { Ip = "9.9.9.9", CountryCode = "JP", Country = "日本", CheckedUtc = now.AddSeconds(25) }) == null);
+            Check("Unresolved IP that resolves to the same country stays silent",
+                tracker.Observe(new Snapshot { Ip = "4.4.4.4", CheckedUtc = now.AddSeconds(30) }) == null &&
+                tracker.Observe(new Snapshot { Ip = "4.4.4.4", CountryCode = "JP", Country = "日本", CheckedUtc = now.AddSeconds(35) }) == null);
+            var stale = new Snapshot { Ip = "1.1.1.1", CountryCode = "SG", Country = "新加坡", CountryIsStale = true, CheckedUtc = now.AddSeconds(40) };
+            Check("Stale cached country notifies like the flag it displays", tracker.Observe(stale) != null);
+        }
+
         private static async Task CountryCacheResilienceTests()
         {
             DateTime start = new DateTime(2026, 9, 24, 0, 0, 0, DateTimeKind.Utc), now = start;

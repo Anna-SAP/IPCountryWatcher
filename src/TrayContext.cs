@@ -32,10 +32,10 @@ namespace IPCountryWatcher
         private Icon ownedIcon;
         private string iconCode = "#";
         private readonly TrayDisplayState displayState = new TrayDisplayState();
+        private readonly CountryChangeTracker countryChanges = new CountryChangeTracker();
         private readonly Func<DateTime> clock;
         private Snapshot current { get { return displayState.Current; } }
         private string status = "正在启动";
-        private Snapshot lastKnown;
         private CancellationTokenSource activeRequest;
         private int failures;
         private volatile bool closing;
@@ -80,7 +80,7 @@ namespace IPCountryWatcher
             var proxy = new ToolStripMenuItem("跟随 Windows 系统代理") { Checked = settings.UseSystemProxy, CheckOnClick = true };
             proxy.Click += (s, e) => { settings.UseSystemProxy = proxy.Checked; SaveSettings(); RequestRefresh(true); };
             menu.Items.Add(proxy);
-            var notify = new ToolStripMenuItem("IP 变化时通知") { Checked = settings.NotifyOnChange, CheckOnClick = true };
+            var notify = new ToolStripMenuItem("国家 / 地区变化时通知") { Checked = settings.NotifyOnChange, CheckOnClick = true };
             notify.Click += (s, e) => { settings.NotifyOnChange = notify.Checked; SaveSettings(); };
             menu.Items.Add(notify);
             startupItem.Checked = !testing && IsStartupEnabled();
@@ -239,18 +239,15 @@ namespace IPCountryWatcher
 
         private void Apply(Snapshot result)
         {
-            Snapshot previous = lastKnown;
             displayState.Accept(result);
             status = result.Error ?? "监控中 · " + result.Source;
             RenderState();
-            if (result.HasIp)
+            // Observe even while notifications are off, so re-enabling them cannot compare against an old country.
+            Snapshot previous = countryChanges.Observe(result);
+            if (!testing && settings.NotifyOnChange && previous != null)
             {
-                if (!testing && settings.NotifyOnChange && previous != null && previous.Ip != result.Ip)
-                {
-                    tray.ShowBalloonTip(4000, "公网 IP 已变化",
-                        previous.Ip + " → " + result.Ip + "\n" + (result.Country ?? "国家待识别"), ToolTipIcon.Info);
-                }
-                lastKnown = result;
+                tray.ShowBalloonTip(4000, "国家 / 地区已变化",
+                    previous.Country + " → " + result.Country + "\n" + previous.Ip + " → " + result.Ip, ToolTipIcon.Info);
             }
         }
 

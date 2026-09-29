@@ -78,6 +78,7 @@ namespace IPCountryWatcher
                 CoreTests().GetAwaiter().GetResult();
                 CountryCacheResilienceTests().GetAwaiter().GetResult();
                 TrayDisplayStateTests();
+                CountryChangeTrackerTests();
                 LatencyTests().GetAwaiter().GetResult();
                 IconTests();
                 SmokeTest();
