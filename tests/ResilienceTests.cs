@@ -48,25 +48,32 @@ namespace IPCountryWatcher
             Check("Confirmed country change is displayed immediately", state.Displayed(now.AddSeconds(6)) == next);
         }
 
-        private static void CountryChangeTrackerTests()
+        private static void EgressChangeTrackerTests()
         {
             DateTime now = new DateTime(2026, 9, 29, 0, 0, 0, DateTimeKind.Utc);
-            var tracker = new CountryChangeTracker();
-            Check("First confirmed country is a baseline, not a change notification", tracker.Observe(Confirmed(now)) == null);
+            var tracker = new EgressChangeTracker();
+            Snapshot first = Confirmed(now);
+            Check("First confirmed result is a baseline, not a change", tracker.Observe(first) == null);
             var sameCountry = new Snapshot { Ip = "1.1.1.1", CountryCode = "SG", Country = "新加坡", CheckedUtc = now.AddSeconds(5) };
-            Check("New IP in the same country does not notify", tracker.Observe(sameCountry) == null);
+            EgressChange ipOnly = tracker.Observe(sameCountry);
+            Check("New IP in the same country is an IP-only change", ipOnly != null && ipOnly.Previous == first && !ipOnly.CountryChanged);
             Check("Failures and a new unresolved IP defer the comparison",
                 tracker.Observe(new Snapshot { Error = "timeout", CheckedUtc = now.AddSeconds(10) }) == null &&
                 tracker.Observe(new Snapshot { Ip = "9.9.9.9", CheckedUtc = now.AddSeconds(15) }) == null);
             var changed = new Snapshot { Ip = "9.9.9.9", CountryCode = "JP", Country = "日本", CheckedUtc = now.AddSeconds(20) };
-            Check("Country resolved later is compared with the last confirmed country", tracker.Observe(changed) == sameCountry);
-            Check("Unchanged country does not notify again",
+            EgressChange country = tracker.Observe(changed);
+            Check("Country resolved later is compared with the last confirmed result",
+                country != null && country.Previous == sameCountry && country.Current == changed && country.CountryChanged);
+            Check("Unchanged IP and country report nothing again",
                 tracker.Observe(new Snapshot { Ip = "9.9.9.9", CountryCode = "JP", Country = "日本", CheckedUtc = now.AddSeconds(25) }) == null);
-            Check("Unresolved IP that resolves to the same country stays silent",
+            EgressChange resolved = null;
+            Check("Unresolved IP that resolves to the same country is reported once, as an IP-only change",
                 tracker.Observe(new Snapshot { Ip = "4.4.4.4", CheckedUtc = now.AddSeconds(30) }) == null &&
-                tracker.Observe(new Snapshot { Ip = "4.4.4.4", CountryCode = "JP", Country = "日本", CheckedUtc = now.AddSeconds(35) }) == null);
+                (resolved = tracker.Observe(new Snapshot { Ip = "4.4.4.4", CountryCode = "JP", Country = "日本", CheckedUtc = now.AddSeconds(35) })) != null &&
+                !resolved.CountryChanged && resolved.Previous.Ip == "9.9.9.9");
             var stale = new Snapshot { Ip = "1.1.1.1", CountryCode = "SG", Country = "新加坡", CountryIsStale = true, CheckedUtc = now.AddSeconds(40) };
-            Check("Stale cached country notifies like the flag it displays", tracker.Observe(stale) != null);
+            EgressChange staleChange = tracker.Observe(stale);
+            Check("Stale cached country is reported like the flag it displays", staleChange != null && staleChange.CountryChanged);
         }
 
         private static async Task CountryCacheResilienceTests()
