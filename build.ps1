@@ -21,7 +21,7 @@ $flags = @(Get-ChildItem -LiteralPath assets\flags -Filter *.png)
 if ($flags.Count -lt 240) { throw 'Missing bundled flag assets. Restore assets/flags before building.' }
 $common = @('/nologo', '/utf8output', '/optimize+', '/warn:4', '/warnaserror+', '/langversion:5', '/platform:anycpu',
     '/r:System.dll', '/r:System.Core.dll', '/r:System.Net.Http.dll', '/r:System.Web.Extensions.dll',
-    '/r:System.Drawing.dll', '/r:System.Windows.Forms.dll', '/win32manifest:app.manifest')
+    '/r:System.Drawing.dll', '/r:System.Windows.Forms.dll', '/r:Microsoft.CSharp.dll', '/win32manifest:app.manifest')
 $assemblyInfo = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'src\AssemblyInfo.cs'))
 $assemblyInfo = $assemblyInfo.Replace('AssemblyVersion("1.0.0.0")', ('AssemblyVersion("' + $Version + '.0")'))
 $assemblyInfo = $assemblyInfo.Replace('AssemblyFileVersion("1.0.0.0")', ('AssemblyFileVersion("' + $Version + '.0")'))

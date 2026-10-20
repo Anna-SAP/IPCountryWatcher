@@ -32,7 +32,10 @@ namespace IPCountryWatcher
         private Icon ownedIcon;
         private string iconCode = "#";
         private readonly TrayDisplayState displayState = new TrayDisplayState();
-        private readonly CountryChangeTracker countryChanges = new CountryChangeTracker();
+        private readonly EgressChangeTracker egressChanges = new EgressChangeTracker();
+        private readonly IVoice voice;
+        // Lets the Windows notification chime finish before the announcement starts.
+        private static readonly TimeSpan ChimeDelay = TimeSpan.FromMilliseconds(600);
         private readonly Func<DateTime> clock;
         private Snapshot current { get { return displayState.Current; } }
         private string status = "正在启动";
@@ -45,12 +48,13 @@ namespace IPCountryWatcher
         internal string TooltipText { get { return tray.Text; } }
         internal bool CanCopyIp { get { return copyItem.Enabled; } }
 
-        public TrayContext(ILookup lookup, Settings settings, bool testing, Func<DateTime> clock = null)
+        public TrayContext(ILookup lookup, Settings settings, bool testing, Func<DateTime> clock = null, IVoice voice = null)
         {
             this.lookup = lookup;
             this.settings = settings;
             this.testing = testing;
             this.clock = clock ?? (() => DateTime.UtcNow);
+            this.voice = voice;
             IntPtr handle = dispatcher.Handle;
             title.Enabled = ipItem.Enabled = countryItem.Enabled = statusItem.Enabled = timeItem.Enabled = false;
             copyItem.Enabled = false;
@@ -83,6 +87,7 @@ namespace IPCountryWatcher
             var notify = new ToolStripMenuItem("国家 / 地区变化时通知") { Checked = settings.NotifyOnChange, CheckOnClick = true };
             notify.Click += (s, e) => { settings.NotifyOnChange = notify.Checked; SaveSettings(); };
             menu.Items.Add(notify);
+            menu.Items.Add(CreateVoiceMenu());
             startupItem.Checked = !testing && IsStartupEnabled();
             startupItem.Click += (s, e) => ToggleStartup();
             menu.Items.Add(startupItem);
@@ -108,6 +113,40 @@ namespace IPCountryWatcher
             };
             if (!testing && settings.MonitoredApplications.Exists(a => a.Enabled)) EnsureProcessMonitor();
             dispatcher.BeginInvoke((Action)(() => Tick(null, EventArgs.Empty)));
+        }
+
+        private ToolStripMenuItem CreateVoiceMenu()
+        {
+            var voiceMenu = new ToolStripMenuItem("语音播报");
+            var modes = new[] { VoiceMode.IpOrCountry, VoiceMode.CountryOnly, VoiceMode.Off };
+            var labels = new[] { "IP 或国家 / 地区变化时", "仅国家 / 地区变化时", "关闭" };
+            var items = new ToolStripMenuItem[modes.Length];
+            for (int i = 0; i < modes.Length; i++)
+            {
+                VoiceMode mode = modes[i];
+                var item = items[i] = new ToolStripMenuItem(labels[i]) { Checked = settings.VoiceMode == mode };
+                item.Click += (s, e) =>
+                {
+                    settings.VoiceMode = mode;
+                    foreach (var other in items) other.Checked = other == item;
+                    SaveSettings();
+                };
+                voiceMenu.DropDownItems.Add(item);
+            }
+            voiceMenu.DropDownItems.Add(new ToolStripSeparator());
+            string name = voice == null ? null : voice.Name;
+            var preview = new ToolStripMenuItem("试听当前出口") { Enabled = name != null };
+            // Only the latest query is spoken; a retained flag awaiting confirmation is not a current result.
+            preview.Click += (s, e) => Speak(VoiceText.Current(current), TimeSpan.Zero);
+            voiceMenu.DropDownItems.Add(preview);
+            voiceMenu.DropDownItems.Add(new ToolStripMenuItem(name != null ? "语音：" + name :
+                "未找到简体中文女声，请在 Windows 语音设置中添加中文") { Enabled = false });
+            return voiceMenu;
+        }
+
+        private void Speak(string text, TimeSpan delay)
+        {
+            if (voice != null) voice.Speak(text, delay);
         }
 
         private void EnsureProcessMonitor()
@@ -242,13 +281,17 @@ namespace IPCountryWatcher
             displayState.Accept(result);
             status = result.Error ?? "监控中 · " + result.Source;
             RenderState();
-            // Observe even while notifications are off, so re-enabling them cannot compare against an old country.
-            Snapshot previous = countryChanges.Observe(result);
-            if (!testing && settings.NotifyOnChange && previous != null)
+            // Observe even while notifications are off, so re-enabling them cannot compare against an old result.
+            EgressChange change = egressChanges.Observe(result);
+            if (change == null) return;
+            bool balloon = !testing && settings.NotifyOnChange && change.CountryChanged;
+            if (balloon)
             {
                 tray.ShowBalloonTip(4000, "国家 / 地区已变化",
-                    previous.Country + " → " + result.Country + "\n" + previous.Ip + " → " + result.Ip, ToolTipIcon.Info);
+                    change.Previous.Country + " → " + result.Country + "\n" + change.Previous.Ip + " → " + result.Ip, ToolTipIcon.Info);
             }
+            if (settings.VoiceMode == VoiceMode.IpOrCountry || (settings.VoiceMode == VoiceMode.CountryOnly && change.CountryChanged))
+                Speak(VoiceText.Change(change), balloon ? ChimeDelay : TimeSpan.Zero);
         }
 
         private void RenderState()
@@ -322,6 +365,7 @@ namespace IPCountryWatcher
             NetworkChange.NetworkAvailabilityChanged -= AvailabilityChanged;
             SystemEvents.PowerModeChanged -= PowerChanged;
             if (activeRequest != null) activeRequest.Cancel();
+            if (voice != null) voice.Dispose();
             tray.Visible = false;
             tray.Dispose();
             if (ownedIcon != null) ownedIcon.Dispose();

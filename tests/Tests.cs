@@ -78,7 +78,8 @@ namespace IPCountryWatcher
                 CoreTests().GetAwaiter().GetResult();
                 CountryCacheResilienceTests().GetAwaiter().GetResult();
                 TrayDisplayStateTests();
-                CountryChangeTrackerTests();
+                EgressChangeTrackerTests();
+                VoiceTests();
                 LatencyTests().GetAwaiter().GetResult();
                 IconTests();
                 SmokeTest();
@@ -87,6 +88,7 @@ namespace IPCountryWatcher
                 TrayRetryTest(true);
                 TrayFailureRetryTest();
                 TrayRetentionExpiryTest();
+                TrayVoiceTest();
                 ProcessWindowTest();
             }
             catch (Exception ex) { Check("Unhandled exception: " + ex, false); }

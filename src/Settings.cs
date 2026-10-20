@@ -4,14 +4,17 @@ using System.Web.Script.Serialization;
 
 namespace IPCountryWatcher
 {
+    public enum VoiceMode { Off = 0, CountryOnly = 1, IpOrCountry = 2 }
+
     public sealed class Settings
     {
         public int PollSeconds { get; set; }
         public bool UseSystemProxy { get; set; }
         public bool NotifyOnChange { get; set; }
+        public VoiceMode VoiceMode { get; set; }
         public int ProcessPollSeconds { get; set; }
         public System.Collections.Generic.List<MonitoredApplication> MonitoredApplications { get; set; }
-        public Settings() { PollSeconds = 5; UseSystemProxy = true; NotifyOnChange = true; ProcessPollSeconds = 30; MonitoredApplications = MonitoredApplication.Defaults(); }
+        public Settings() { PollSeconds = 5; UseSystemProxy = true; NotifyOnChange = true; VoiceMode = VoiceMode.IpOrCountry; ProcessPollSeconds = 30; MonitoredApplications = MonitoredApplication.Defaults(); }
         internal static string Folder { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "IPCountryWatcher"); } }
         internal static Settings Load()
         {
@@ -23,6 +26,7 @@ namespace IPCountryWatcher
                 if (settings == null) return new Settings();
                 if (settings.PollSeconds != 5 && settings.PollSeconds != 10 && settings.PollSeconds != 30 && settings.PollSeconds != 60)
                     settings.PollSeconds = 5;
+                if (!Enum.IsDefined(typeof(VoiceMode), settings.VoiceMode)) settings.VoiceMode = VoiceMode.IpOrCountry;
                 if (settings.ProcessPollSeconds != 15 && settings.ProcessPollSeconds != 30 && settings.ProcessPollSeconds != 60) settings.ProcessPollSeconds = 30;
                 if (settings.MonitoredApplications == null) settings.MonitoredApplications = MonitoredApplication.Defaults();
                 MonitoredApplication.Validate(settings.MonitoredApplications);
