@@ -77,6 +77,9 @@ namespace IPCountryWatcher
                 ProcessTests().GetAwaiter().GetResult();
                 CoreTests().GetAwaiter().GetResult();
                 CountryCacheResilienceTests().GetAwaiter().GetResult();
+                RunConnectivityTests().GetAwaiter().GetResult();
+                RunNetworkDiagnosticsTests();
+                ConnectionPresentationTests();
                 TrayDisplayStateTests();
                 EgressChangeTrackerTests();
                 VoiceTests();
@@ -88,6 +91,9 @@ namespace IPCountryWatcher
                 TrayRetryTest(true);
                 TrayFailureRetryTest();
                 TrayRetentionExpiryTest();
+                TrayConnectivityTest();
+                TrayFreshnessDuringRequestTest();
+                TrayFingerprintTest();
                 TrayVoiceTest();
                 ProcessWindowTest();
             }
