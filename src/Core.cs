@@ -19,6 +19,7 @@ namespace IPCountryWatcher
         public string Error;
         public DateTime CheckedUtc;
         public bool CountryIsStale;
+        public ConnectivitySnapshot Connectivity;
         public bool HasIp { get { return !String.IsNullOrEmpty(Ip); } }
         public bool HasCountry { get { return !String.IsNullOrEmpty(CountryCode); } }
     }
@@ -38,6 +39,13 @@ namespace IPCountryWatcher
         public readonly TimeSpan RetryAfter;
         public RateLimitException(TimeSpan retryAfter) : base("查询服务暂时限流")
         { RetryAfter = retryAfter; }
+    }
+
+    internal sealed class HttpStatusException : HttpRequestException
+    {
+        internal readonly int StatusCode;
+        internal HttpStatusException(int statusCode) : base("查询服务返回 HTTP " + statusCode)
+        { StatusCode = statusCode; }
     }
 
     internal sealed class HttpTransport : ITransport
@@ -66,7 +74,7 @@ namespace IPCountryWatcher
                             if (delay < TimeSpan.FromMinutes(1)) delay = TimeSpan.FromMinutes(1);
                             throw new RateLimitException(delay);
                         }
-                        response.EnsureSuccessStatusCode();
+                        if (!response.IsSuccessStatusCode) throw new HttpStatusException((int)response.StatusCode);
                         return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                     }
                 }

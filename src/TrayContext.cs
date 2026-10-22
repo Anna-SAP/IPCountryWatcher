@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Drawing;
+using System.IO;
 using System.Net.NetworkInformation;
 using System.Threading;
 using System.Threading.Tasks;
@@ -22,6 +23,8 @@ namespace IPCountryWatcher
         private readonly ToolStripMenuItem ipItem = new ToolStripMenuItem("本程序公网 IP：正在查询…");
         private readonly ToolStripMenuItem countryItem = new ToolStripMenuItem("国家 / 地区：待识别");
         private readonly ToolStripMenuItem statusItem = new ToolStripMenuItem("正在启动");
+        private readonly ToolStripMenuItem connectivityItem = new ToolStripMenuItem("连接：待确认");
+        private readonly ToolStripMenuItem probesItem = new ToolStripMenuItem("检测尚未完成");
         private readonly ToolStripMenuItem timeItem = new ToolStripMenuItem("尚未完成查询");
         private readonly ToolStripMenuItem copyItem = new ToolStripMenuItem("复制公网 IP");
         private readonly ToolStripMenuItem startupItem = new ToolStripMenuItem("开机启动");
@@ -31,6 +34,13 @@ namespace IPCountryWatcher
         private ProcessMonitorForm processForm;
         private Icon ownedIcon;
         private string iconCode = "#";
+        private ConnectionBadge iconBadge;
+        private readonly DiagnosticLog diagnostics;
+        private readonly INetworkFingerprint fingerprint;
+        private string lastFingerprint;
+        private DateTime nextFingerprintUtc;
+        private bool readingFingerprint;
+        private DateTime lastTickUtc;
         private readonly TrayDisplayState displayState = new TrayDisplayState();
         private readonly EgressChangeTracker egressChanges = new EgressChangeTracker();
         private readonly IVoice voice;
@@ -47,21 +57,28 @@ namespace IPCountryWatcher
         internal string StatusText { get { return statusItem.Text; } }
         internal string TooltipText { get { return tray.Text; } }
         internal bool CanCopyIp { get { return copyItem.Enabled; } }
+        internal ConnectionBadge VisibleBadge { get { return iconBadge; } }
+        internal string ConnectivityText { get { return connectivityItem.Text; } }
 
-        public TrayContext(ILookup lookup, Settings settings, bool testing, Func<DateTime> clock = null, IVoice voice = null)
+        public TrayContext(ILookup lookup, Settings settings, bool testing, Func<DateTime> clock = null, IVoice voice = null,
+            INetworkFingerprint fingerprint = null)
         {
             this.lookup = lookup;
             this.settings = settings;
             this.testing = testing;
             this.clock = clock ?? (() => DateTime.UtcNow);
             this.voice = voice;
+            this.fingerprint = fingerprint ?? (testing ? null : new NetworkFingerprint());
+            diagnostics = new DiagnosticLog(this.clock);
+            diagnostics.Record("start", "IPCountryWatcher " + Application.ProductVersion);
             IntPtr handle = dispatcher.Handle;
-            title.Enabled = ipItem.Enabled = countryItem.Enabled = statusItem.Enabled = timeItem.Enabled = false;
+            title.Enabled = ipItem.Enabled = countryItem.Enabled = statusItem.Enabled = timeItem.Enabled = connectivityItem.Enabled = probesItem.Enabled = false;
             copyItem.Enabled = false;
             menu.Font = new Font("Microsoft YaHei UI", 9f);
-            menu.Items.AddRange(new ToolStripItem[] { title, new ToolStripSeparator(), ipItem, countryItem, statusItem, timeItem, new ToolStripSeparator() });
+            menu.Items.AddRange(new ToolStripItem[] { title, new ToolStripSeparator(), ipItem, countryItem, connectivityItem, probesItem, statusItem, timeItem, new ToolStripSeparator() });
             menu.Items.Add("立即刷新", null, (s, e) => RequestRefresh());
             menu.Items.Add(copyItem);
+            menu.Items.Add("导出连接诊断…", null, (s, e) => ExportDiagnostics());
             copyItem.Click += (s, e) => CopyIp();
             var interval = new ToolStripMenuItem("检查间隔");
             foreach (int seconds in new[] { 5, 10, 30, 60 })
@@ -93,12 +110,12 @@ namespace IPCountryWatcher
             menu.Items.Add(startupItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("关于", null, (s, e) => MessageBox.Show(
-                "IP 国旗监视器 " + Application.ProductVersion + "\n\n网络变化时自动检查，定时轮询公网出口。\n灰色地球表示正在查询或结果未确认。\n\nIP：icanhazip / Cloudflare trace / ifconfig.me\n国家：ipwho.is / ipapi.co\n国旗：Flagpedia.net / flagcdn.com（已内嵌）\n\n这些查询服务会获知请求的公网 IP。\n显示的是本程序请求所经过的出口，分流代理下\n可能与浏览器或其他应用不同。\n\n双击图标可立即刷新；右键打开菜单。",
+                "IP 国旗监视器 " + Application.ProductVersion + "\n\n国旗表示出口国家；连接状态单独验证。\n黄色 !：待确认、部分可达或国家缓存待更新。\n红色 ×：本轮所测连接未确认。\n地球：国家未知，不等于整个系统断网。\n\nIP：icanhazip / Cloudflare trace / ifconfig.me\n连接检测：Cloudflare trace / ifconfig.me\n国家：ipwho.is / ipapi.co\n国旗：Flagpedia.net / flagcdn.com（已内嵌）\n\n这些服务会获知请求的公网 IP。\n检测结果仅代表本程序访问所测服务的路径，\n不能证明微信等其他应用或所有地址族正常。\n\n双击刷新；右键可导出本次运行的连接诊断。",
                 "关于 IP 国旗监视器", MessageBoxButtons.OK, MessageBoxIcon.Information));
             menu.Items.Add("退出", null, (s, e) => ExitThread());
             tray.ContextMenuStrip = menu;
             tray.DoubleClick += (s, e) => RequestRefresh();
-            SetIcon(null);
+            SetIcon(null, ConnectionBadge.Pending);
             tray.Text = "IP 国旗监视器 · 正在查询";
             tray.Visible = true;
             timer.Interval = 100;
@@ -137,7 +154,7 @@ namespace IPCountryWatcher
             string name = voice == null ? null : voice.Name;
             var preview = new ToolStripMenuItem("试听当前出口") { Enabled = name != null };
             // Only the latest query is spoken; a retained flag awaiting confirmation is not a current result.
-            preview.Click += (s, e) => Speak(VoiceText.Current(current), TimeSpan.Zero);
+            preview.Click += (s, e) => Speak(VoiceText.Current(displayState.IsIpFresh(this.clock()) ? current : null), TimeSpan.Zero);
             voiceMenu.DropDownItems.Add(preview);
             voiceMenu.DropDownItems.Add(new ToolStripMenuItem(name != null ? "语音：" + name :
                 "未找到简体中文女声，请在 Windows 语音设置中添加中文") { Enabled = false });
@@ -193,14 +210,15 @@ namespace IPCountryWatcher
             catch (Exception ex) { ShowError("无法保存设置：" + ex.Message); }
         }
 
-        private void SetIcon(string code)
+        private void SetIcon(string code, ConnectionBadge badge)
         {
-            if (code == iconCode) return;
-            var replacement = FlagIcons.Create(code, Math.Max(16, SystemInformation.SmallIconSize.Width));
+            if (code == iconCode && badge == iconBadge) return;
+            var replacement = FlagIcons.Create(code, Math.Max(16, SystemInformation.SmallIconSize.Width), badge);
             tray.Icon = replacement;
             var old = ownedIcon;
             ownedIcon = replacement;
             iconCode = code;
+            iconBadge = badge;
             if (old != null) old.Dispose();
         }
 
@@ -229,7 +247,10 @@ namespace IPCountryWatcher
             failures = 0;
             if (processMonitor != null) processMonitor.Invalidate();
             if (activeRequest != null) activeRequest.Cancel();
+            var invalidatable = lookup as IInvalidatableLookup;
+            if (invalidatable != null) invalidatable.Invalidate();
             displayState.Invalidate(clearPrevious);
+            diagnostics.Record("invalidate", clearPrevious ? "previous egress cleared" : "previous egress pending verification");
             status = "正在重新确认网络出口…";
             RenderState();
             if (debounce == TimeSpan.Zero) Tick(null, EventArgs.Empty);
@@ -238,9 +259,19 @@ namespace IPCountryWatcher
         private async void Tick(object sender, EventArgs args)
         {
             if (closing) return;
-            // Expire a retained flag even while a request or the retry timer is pending.
-            if (iconCode != null && (current == null || !current.HasCountry) && displayState.Displayed(clock()) == null)
-                RenderState();
+            DateTime now = clock();
+            if (lastTickUtc != DateTime.MinValue && now < lastTickUtc)
+            {
+                lastTickUtc = now;
+                nextFingerprintUtc = DateTime.MinValue;
+                diagnostics.Record("clock-change", "clock moved backwards; revalidating measurements");
+                RequestRefresh();
+                return;
+            }
+            lastTickUtc = now;
+            CheckNetworkFingerprint();
+            // Re-render freshness even during an in-flight request or long user polling interval.
+            RenderState();
             int generation = schedule.Begin(clock());
             if (generation < 0) return;
             activeRequest = new CancellationTokenSource();
@@ -252,7 +283,7 @@ namespace IPCountryWatcher
             {
                 var result = await Task.Run(() => lookup.QueryAsync(useProxy, request.Token));
                 if (closing || !schedule.IsCurrent(generation)) return;
-                failures = result.HasIp ? 0 : Math.Min(5, failures + 1);
+                failures = result.HasIp || (result.Connectivity != null && result.Connectivity.Health != ConnectivityHealth.Unreachable) ? 0 : Math.Min(5, failures + 1);
                 Apply(result);
             }
             catch (OperationCanceledException) { }
@@ -270,6 +301,14 @@ namespace IPCountryWatcher
                 request.Dispose();
                 // The first failed check should recover promptly, even with 60-second polling.
                 double seconds = failures == 0 ? settings.PollSeconds : Math.Min(60, 5 * Math.Pow(2, failures - 1));
+                if (current != null && current.Connectivity != null)
+                {
+                    // Healthy results have a finite lifetime, including when the user selected 60s.
+                    if (current.Connectivity.Health == ConnectivityHealth.Reachable)
+                        seconds = Math.Min(seconds, Math.Max(1, (current.Connectivity.CheckedUtc.Add(ConnectivitySnapshot.MaximumAge) - clock()).TotalSeconds - 5));
+                    else if (current.Connectivity.Health == ConnectivityHealth.Limited || current.Connectivity.Health == ConnectivityHealth.Checking)
+                        seconds = Math.Min(seconds, 5);
+                }
                 // An unresolved country must not wait for a long user-selected IP polling interval.
                 if (current != null && current.HasIp && (!current.HasCountry || current.CountryIsStale)) seconds = Math.Min(5, seconds);
                 schedule.Complete(generation, clock(), TimeSpan.FromSeconds(seconds));
@@ -279,6 +318,7 @@ namespace IPCountryWatcher
         private void Apply(Snapshot result)
         {
             displayState.Accept(result);
+            diagnostics.RecordResult(result);
             status = result.Error ?? "监控中 · " + result.Source;
             RenderState();
             // Observe even while notifications are off, so re-enabling them cannot compare against an old result.
@@ -296,9 +336,18 @@ namespace IPCountryWatcher
 
         private void RenderState()
         {
-            Snapshot shown = displayState.Displayed(clock());
-            bool retained = shown != null && shown != current;
-            SetIcon(shown == null ? null : shown.CountryCode);
+            DateTime now = clock();
+            Snapshot shown = displayState.Displayed(now);
+            bool retained = shown != null && (shown != current || !displayState.IsIpFresh(now));
+            ConnectivityHealth health = displayState.Health(now);
+            string healthText = health == ConnectivityHealth.Reachable ? "检测服务可达" :
+                health == ConnectivityHealth.Limited ? "部分检测可达" :
+                health == ConnectivityHealth.Unreachable ? "所测连接未确认" : "连接待确认";
+            SetIcon(shown == null ? null : shown.CountryCode, displayState.Badge(now));
+            connectivityItem.Text = "连接：" + healthText + " · " + (settings.UseSystemProxy ? "系统代理模式" : "直连模式（含 VPN）");
+            var connectivity = current == null ? null : current.Connectivity;
+            probesItem.Text = connectivity == null ? "检测尚未完成；不代表其他应用的连接状态" :
+                (health == ConnectivityHealth.Checking ? "上次探测：" : "探测时间：") + connectivity.CheckedUtc.ToLocalTime().ToString("HH:mm:ss") + " · " + ProbeSummary(connectivity);
             ipItem.Text = retained ? "上次确认 IP（待复核）：" + shown.Ip :
                 "本程序公网 IP：" + (current == null ? "正在查询…" : current.Ip ?? "无法获取");
             countryItem.Text = (retained ? "上次国家 / 地区：" : "国家 / 地区：") +
@@ -307,18 +356,67 @@ namespace IPCountryWatcher
             statusItem.Text = status + (retained ? " · 暂留上次国旗（最多 2 分钟）" : "");
             timeItem.Text = retained ? "上次确认：" + shown.CheckedUtc.ToLocalTime().ToString("HH:mm:ss") :
                 current == null ? "尚未完成本次查询" : "检查时间：" + current.CheckedUtc.ToLocalTime().ToString("HH:mm:ss");
-            copyItem.Enabled = current != null && current.HasIp;
-            string tooltip = retained ? "待确认 · 上次 " + shown.CountryCode + " · " + shown.Ip :
+            copyItem.Enabled = displayState.IsIpFresh(now);
+            string tooltip = retained ? healthText + " · 待确认 · 上次 " + shown.CountryCode + " · " + shown.Ip :
                 shown != null ? (shown.CountryIsStale ? "国家缓存待更新 · " : "") + shown.CountryCode + " · " + shown.Ip :
                 current != null && current.HasIp ? "国家待识别 · " + current.Ip : "网络未确认 · 等待重试";
+            if (!retained) tooltip = healthText + " · " + tooltip;
             tray.Text = tooltip.Length > 63 ? tooltip.Substring(0, 63) : tooltip;
         }
 
         private void CopyIp()
         {
-            if (current == null || !current.HasIp) return;
+            if (!displayState.IsIpFresh(clock())) return;
             try { Clipboard.SetText(current.Ip); }
             catch (System.Runtime.InteropServices.ExternalException) { ShowError("剪贴板正忙，请重试。"); }
+        }
+
+        private static string ProbeSummary(ConnectivitySnapshot snapshot)
+        {
+            if (snapshot.Results == null) return "未提供逐项结果";
+            return String.Join(" / ", Array.ConvertAll(snapshot.Results, p => p.Source + ": " + (p.Success ? "通过" : FailureText(p.Failure))));
+        }
+
+        private static string FailureText(string failure)
+        {
+            if (failure == "timeout") return "超时";
+            if (failure == "dns" || failure == "proxy-dns") return "域名解析失败";
+            if (failure == "tls") return "安全连接失败";
+            if (failure == "invalid-response") return "返回内容异常";
+            if (failure == "previous-request-pending") return "前次请求未结束";
+            if (failure != null && failure.StartsWith("http-429", StringComparison.Ordinal)) return "服务限流，稍后重试";
+            return "连接未确认";
+        }
+
+        private async void CheckNetworkFingerprint()
+        {
+            if (fingerprint == null || readingFingerprint || clock() < nextFingerprintUtc) return;
+            readingFingerprint = true;
+            nextFingerprintUtc = clock().AddSeconds(5);
+            try
+            {
+                string value = await Task.Run(() => fingerprint.Read());
+                if (closing) return;
+                if (lastFingerprint != null && !String.Equals(value, lastFingerprint, StringComparison.Ordinal))
+                {
+                    diagnostics.Record("network-change", "route, interface, DNS or proxy configuration changed");
+                    RequestRefresh();
+                }
+                lastFingerprint = value;
+            }
+            catch (Exception) { if (!closing) diagnostics.Record("network-read", "configuration unavailable"); }
+            finally { readingFingerprint = false; }
+        }
+
+        private void ExportDiagnostics()
+        {
+            using (var dialog = new SaveFileDialog { Title = "导出本次运行的连接诊断", Filter = "文本文件 (*.txt)|*.txt",
+                FileName = "IPCountryWatcher-diagnostics-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt" })
+            {
+                if (dialog.ShowDialog() != DialogResult.OK) return;
+                try { File.WriteAllText(dialog.FileName, diagnostics.ExportText(), new System.Text.UTF8Encoding(true)); }
+                catch (Exception ex) { ShowError("无法导出诊断：" + ex.Message); }
+            }
         }
 
         private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";

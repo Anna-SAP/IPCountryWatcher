@@ -25,7 +25,10 @@ namespace IPCountryWatcher
                     Thread.CurrentThread.CurrentUICulture = CultureInfo.GetCultureInfo("zh-CN");
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
-                    using (var context = new TrayContext(new LookupService(new HttpTransport(), () => DateTime.UtcNow), Settings.Load(), false,
+                    var transport = new HttpTransport();
+                    var lookup = new ConnectivityLookup(new LookupService(transport, () => DateTime.UtcNow),
+                        new ConnectivityProbe(transport, () => DateTime.UtcNow), () => DateTime.UtcNow);
+                    using (var context = new TrayContext(lookup, Settings.Load(), false,
                         null, new ChineseVoice()))
                     {
                         if (Array.IndexOf(args, "--process-monitor") >= 0) context.ShowProcessMonitor();
