@@ -82,6 +82,7 @@ namespace IPCountryWatcher
                 ConnectionPresentationTests();
                 TrayDisplayStateTests();
                 EgressChangeTrackerTests();
+                ConnectionAlertTrackerTests();
                 VoiceTests();
                 LatencyTests().GetAwaiter().GetResult();
                 IconTests();
@@ -95,6 +96,8 @@ namespace IPCountryWatcher
                 TrayFreshnessDuringRequestTest();
                 TrayFingerprintTest();
                 TrayVoiceTest();
+                TrayConnectionAlertTest();
+                RestartTests();
                 ProcessWindowTest();
             }
             catch (Exception ex) { Check("Unhandled exception: " + ex, false); }

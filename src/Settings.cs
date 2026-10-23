@@ -12,9 +12,11 @@ namespace IPCountryWatcher
         public bool UseSystemProxy { get; set; }
         public bool NotifyOnChange { get; set; }
         public VoiceMode VoiceMode { get; set; }
+        // Connection loss and recovery announcements; VoiceMode.Off silences them too.
+        public bool AnnounceConnection { get; set; }
         public int ProcessPollSeconds { get; set; }
         public System.Collections.Generic.List<MonitoredApplication> MonitoredApplications { get; set; }
-        public Settings() { PollSeconds = 5; UseSystemProxy = true; NotifyOnChange = true; VoiceMode = VoiceMode.IpOrCountry; ProcessPollSeconds = 30; MonitoredApplications = MonitoredApplication.Defaults(); }
+        public Settings() { PollSeconds = 5; UseSystemProxy = true; NotifyOnChange = true; VoiceMode = VoiceMode.IpOrCountry; AnnounceConnection = true; ProcessPollSeconds = 30; MonitoredApplications = MonitoredApplication.Defaults(); }
         internal static string Folder { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "IPCountryWatcher"); } }
         internal static Settings Load()
         {
