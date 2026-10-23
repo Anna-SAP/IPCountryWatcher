@@ -43,6 +43,7 @@ namespace IPCountryWatcher
         private DateTime lastTickUtc;
         private readonly TrayDisplayState displayState = new TrayDisplayState();
         private readonly EgressChangeTracker egressChanges = new EgressChangeTracker();
+        private readonly ConnectionAlertTracker connectionAlerts = new ConnectionAlertTracker();
         private readonly IVoice voice;
         // Lets the Windows notification chime finish before the announcement starts.
         private static readonly TimeSpan ChimeDelay = TimeSpan.FromMilliseconds(600);
@@ -59,6 +60,8 @@ namespace IPCountryWatcher
         internal bool CanCopyIp { get { return copyItem.Enabled; } }
         internal ConnectionBadge VisibleBadge { get { return iconBadge; } }
         internal string ConnectivityText { get { return connectivityItem.Text; } }
+        internal ContextMenuStrip Menu { get { return menu; } }
+        internal bool RestartRequested { get; private set; }
 
         public TrayContext(ILookup lookup, Settings settings, bool testing, Func<DateTime> clock = null, IVoice voice = null,
             INetworkFingerprint fingerprint = null)
@@ -112,6 +115,7 @@ namespace IPCountryWatcher
             menu.Items.Add("关于", null, (s, e) => MessageBox.Show(
                 "IP 国旗监视器 " + Application.ProductVersion + "\n\n国旗表示出口国家；连接状态单独验证。\n黄色 !：待确认、部分可达或国家缓存待更新。\n红色 ×：本轮所测连接未确认。\n地球：国家未知，不等于整个系统断网。\n\nIP：icanhazip / Cloudflare trace / ifconfig.me\n连接检测：Cloudflare trace / ifconfig.me\n国家：ipwho.is / ipapi.co\n国旗：Flagpedia.net / flagcdn.com（已内嵌）\n\n这些服务会获知请求的公网 IP。\n检测结果仅代表本程序访问所测服务的路径，\n不能证明微信等其他应用或所有地址族正常。\n\n双击刷新；右键可导出本次运行的连接诊断。",
                 "关于 IP 国旗监视器", MessageBoxButtons.OK, MessageBoxIcon.Information));
+            menu.Items.Add("重启应用", null, (s, e) => Restart());
             menu.Items.Add("退出", null, (s, e) => ExitThread());
             tray.ContextMenuStrip = menu;
             tray.DoubleClick += (s, e) => RequestRefresh();
@@ -138,6 +142,10 @@ namespace IPCountryWatcher
             var modes = new[] { VoiceMode.IpOrCountry, VoiceMode.CountryOnly, VoiceMode.Off };
             var labels = new[] { "IP 或国家 / 地区变化时", "仅国家 / 地区变化时", "关闭" };
             var items = new ToolStripMenuItem[modes.Length];
+            // "关闭" silences every announcement, so this option is unavailable while it is selected.
+            var connection = new ToolStripMenuItem("连接异常及恢复时播报") { Checked = settings.AnnounceConnection,
+                CheckOnClick = true, Enabled = settings.VoiceMode != VoiceMode.Off };
+            connection.Click += (s, e) => { settings.AnnounceConnection = connection.Checked; SaveSettings(); };
             for (int i = 0; i < modes.Length; i++)
             {
                 VoiceMode mode = modes[i];
@@ -146,10 +154,13 @@ namespace IPCountryWatcher
                 {
                     settings.VoiceMode = mode;
                     foreach (var other in items) other.Checked = other == item;
+                    connection.Enabled = mode != VoiceMode.Off;
                     SaveSettings();
                 };
                 voiceMenu.DropDownItems.Add(item);
             }
+            voiceMenu.DropDownItems.Add(new ToolStripSeparator());
+            voiceMenu.DropDownItems.Add(connection);
             voiceMenu.DropDownItems.Add(new ToolStripSeparator());
             string name = voice == null ? null : voice.Name;
             var preview = new ToolStripMenuItem("试听当前出口") { Enabled = name != null };
@@ -272,6 +283,7 @@ namespace IPCountryWatcher
             CheckNetworkFingerprint();
             // Re-render freshness even during an in-flight request or long user polling interval.
             RenderState();
+            AnnounceConnection(false);
             int generation = schedule.Begin(clock());
             if (generation < 0) return;
             activeRequest = new CancellationTokenSource();
@@ -323,15 +335,32 @@ namespace IPCountryWatcher
             RenderState();
             // Observe even while notifications are off, so re-enabling them cannot compare against an old result.
             EgressChange change = egressChanges.Observe(result);
-            if (change == null) return;
-            bool balloon = !testing && settings.NotifyOnChange && change.CountryChanged;
-            if (balloon)
+            bool changeSpoken = false;
+            if (change != null)
             {
-                tray.ShowBalloonTip(4000, "国家 / 地区已变化",
-                    change.Previous.Country + " → " + result.Country + "\n" + change.Previous.Ip + " → " + result.Ip, ToolTipIcon.Info);
+                bool balloon = !testing && settings.NotifyOnChange && change.CountryChanged;
+                if (balloon)
+                {
+                    tray.ShowBalloonTip(4000, "国家 / 地区已变化",
+                        change.Previous.Country + " → " + result.Country + "\n" + change.Previous.Ip + " → " + result.Ip, ToolTipIcon.Info);
+                }
+                changeSpoken = settings.VoiceMode == VoiceMode.IpOrCountry || (settings.VoiceMode == VoiceMode.CountryOnly && change.CountryChanged);
+                if (changeSpoken) Speak(VoiceText.Change(change), balloon ? ChimeDelay : TimeSpan.Zero);
             }
-            if (settings.VoiceMode == VoiceMode.IpOrCountry || (settings.VoiceMode == VoiceMode.CountryOnly && change.CountryChanged))
-                Speak(VoiceText.Change(change), balloon ? ChimeDelay : TimeSpan.Zero);
+            AnnounceConnection(changeSpoken);
+        }
+
+        // A spoken egress change already tells the user that the connection works again.
+        private void AnnounceConnection(bool changeSpoken)
+        {
+            DateTime now = clock();
+            // Observe even while announcements are off, so enabling them mid-outage cannot report a stale state.
+            ConnectionAlert alert = connectionAlerts.Observe(now, displayState.IsIpFresh(now), displayState.Health(now));
+            if (alert == ConnectionAlert.None) return;
+            diagnostics.Record("connection-alert", alert.ToString());
+            if (settings.VoiceMode == VoiceMode.Off || !settings.AnnounceConnection ||
+                (alert == ConnectionAlert.Restored && changeSpoken)) return;
+            Speak(VoiceText.Connection(alert, current), TimeSpan.Zero);
         }
 
         private void RenderState()
@@ -444,6 +473,13 @@ namespace IPCountryWatcher
                 startupItem.Checked = IsStartupEnabled();
             }
             catch (Exception ex) { ShowError("无法更新开机启动：" + ex.Message); }
+        }
+
+        // Program starts the new instance after this one has released its tray icon, voice, probes and mutex.
+        internal void Restart()
+        {
+            RestartRequested = true;
+            ExitThread();
         }
 
         private void ShowError(string text)

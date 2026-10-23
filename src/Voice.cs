@@ -78,6 +78,14 @@ namespace IPCountryWatcher
             string ip = SpokenIp(current.Ip);
             return "当前网络出口在" + current.Country + "，" + (ip == null ? "使用 IPv6 地址。" : "公网 IP 是" + ip + "。");
         }
+
+        // Says what the tray badge shows; a failed check is not proof that the whole PC is offline.
+        internal static string Connection(ConnectionAlert alert, Snapshot current)
+        {
+            if (alert == ConnectionAlert.Failed) return "网络连接异常，检测请求均未成功，正在等待重试。";
+            if (alert == ConnectionAlert.Unconfirmed) return "网络连接待确认，暂时无法获取公网 IP，正在等待重试。";
+            return current != null && current.HasCountry ? "网络连接已恢复，出口在" + current.Country + "。" : "网络连接已恢复。";
+        }
     }
 
     // Speaks through SAPI with the voices installed in Windows, offline; nothing is sent to a speech service.
@@ -89,6 +97,10 @@ namespace IPCountryWatcher
             @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech_OneCore\Voices",
             @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices" };
         internal const int SpeakAsync = 1, PurgeBeforeSpeak = 2, IsXml = 8;
+        // SVPOver. A normal-priority SAPI voice waits until every other normal SAPI voice on the audio device,
+        // in any process, has finished, and an alert-priority voice interrupts them. Over priority mixes with
+        // them instead; the stream is shared-mode like music and video, never exclusive.
+        internal const int OverPriority = 2;
         private readonly dynamic voice;
         public string Name { get; private set; }
 
@@ -139,6 +151,7 @@ namespace IPCountryWatcher
             voice.Voice = tokens[name];
             voice.Rate = -1;
             voice.Volume = 90;
+            voice.Priority = OverPriority;
             return voice;
         }
 
