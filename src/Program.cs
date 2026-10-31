@@ -31,15 +31,17 @@ namespace IPCountryWatcher
                     Thread.CurrentThread.CurrentUICulture = CultureInfo.GetCultureInfo("zh-CN");
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
-                    var transport = new HttpTransport();
-                    var lookup = new ConnectivityLookup(new LookupService(transport, () => DateTime.UtcNow),
-                        new ConnectivityProbe(transport, () => DateTime.UtcNow), () => DateTime.UtcNow);
-                    using (var context = new TrayContext(lookup, Settings.Load(), false,
-                        null, new ChineseVoice()))
+                    using (var transport = new HttpTransport())
                     {
-                        if (Array.IndexOf(args, "--process-monitor") >= 0) context.ShowProcessMonitor();
-                        Application.Run(context);
-                        restart = context.RestartRequested;
+                        var lookup = new ConnectivityLookup(new LookupService(transport, () => DateTime.UtcNow),
+                            new ConnectivityProbe(transport, () => DateTime.UtcNow), () => DateTime.UtcNow);
+                        using (var context = new TrayContext(lookup, Settings.Load(), false,
+                            null, new ChineseVoice(), null, null, transport))
+                        {
+                            if (Array.IndexOf(args, "--process-monitor") >= 0) context.ShowProcessMonitor();
+                            Application.Run(context);
+                            restart = context.RestartRequested;
+                        }
                     }
                 }
                 catch (Exception ex)

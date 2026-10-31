@@ -52,6 +52,7 @@ namespace IPCountryWatcher
         private readonly ITransport transport;
         private readonly Func<DateTime> clock;
         private readonly int timeoutMilliseconds;
+        private readonly LatencyTracker latency = new LatencyTracker();
         private readonly object attemptGate = new object();
         // There are only two configured hosts. A broken transport can leave at
         // most one unfinished request per host, rather than one per retry.
@@ -73,7 +74,8 @@ namespace IPCountryWatcher
             token.ThrowIfCancellationRequested();
             using (var budget = CancellationTokenSource.CreateLinkedTokenSource(token))
             {
-                budget.CancelAfter(timeoutMilliseconds);
+                // A slow but answering path earns up to twice the configured deadline.
+                budget.CancelAfter(latency.Budget(timeoutMilliseconds));
                 try
                 {
                     // Both independent hosts start now, rather than treating a second
@@ -139,6 +141,7 @@ namespace IPCountryWatcher
                 token.ThrowIfCancellationRequested();
                 if (trace) Validation.ResponseIp(body); else Validation.PublicIp(body);
                 result.Success = true;
+                latency.Record(watch.ElapsedMilliseconds);
             }
             catch (Exception ex)
             {

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
@@ -215,13 +216,23 @@ namespace IPCountryWatcher
         // they are not a general-purpose secret scrubber.
         internal void Record(string eventName, string detail)
         {
-            string value = clock().ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) + " | " +
-                OneLine(eventName, 64) + " | " + OneLine(detail, 768);
+            string value = Format(clock(), eventName, detail);
             lock (gate)
             {
                 while (records.Count >= Capacity) records.Dequeue();
                 records.Enqueue(value);
             }
+        }
+
+        internal static string Format(DateTime time, string eventName, string detail)
+        {
+            return time.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) + " | " +
+                OneLine(eventName, 64) + " | " + OneLine(detail, 768);
+        }
+
+        internal string[] Records()
+        {
+            lock (gate) return records.ToArray();
         }
 
         internal void RecordResult(Snapshot snapshot)
@@ -242,8 +253,7 @@ namespace IPCountryWatcher
 
         internal string ExportText()
         {
-            string[] copy;
-            lock (gate) copy = records.ToArray();
+            string[] copy = Records();
             return "IPCountryWatcher network diagnostics\r\nVersion: " + typeof(DiagnosticLog).Assembly.GetName().Version +
                 "\r\nUTC times; last 120 session events; export requested by user.\r\n" +
                 "Probe results describe the tested path, not every application.\r\n\r\n" + String.Join("\r\n", copy) + "\r\n";
@@ -278,6 +288,75 @@ namespace IPCountryWatcher
             foreach (char c in value)
                 if (!(Char.IsLetterOrDigit(c) || c == '.' || c == '-' || c == '_')) return "other";
             return value;
+        }
+    }
+
+    // Survives restarts, unlike DiagnosticLog, so an outage noticed later can still be
+    // exported. Same rules: callers pass categories and numbers, never IPs or payloads.
+    // Bounded to two files; write failures never affect monitoring. Call on one thread.
+    internal sealed class IncidentJournal
+    {
+        internal const long DefaultMaximumBytes = 1024 * 1024;
+        internal const string FileName = "incidents.log";
+        private readonly string folder;
+        private readonly string previousPath;
+        private readonly long maximumBytes;
+        private readonly Func<DateTime> clock;
+
+        internal IncidentJournal(string folder, Func<DateTime> clock, long maximumBytes = DefaultMaximumBytes)
+        {
+            this.folder = folder;
+            this.clock = clock;
+            this.maximumBytes = maximumBytes;
+            FilePath = System.IO.Path.Combine(folder, FileName);
+            previousPath = System.IO.Path.Combine(folder, "incidents.1.log");
+        }
+
+        internal string FilePath { get; private set; }
+
+        internal void Record(string eventName, string detail)
+        {
+            Append(new[] { DiagnosticLog.Format(clock(), eventName, detail) });
+        }
+
+        // Copies the in-memory ring, already reduced to safe categories, when an outage starts.
+        internal void RecordSnapshot(string[] records)
+        {
+            var lines = new List<string> { DiagnosticLog.Format(clock(), "snapshot-begin",
+                records.Length.ToString(CultureInfo.InvariantCulture) + " recent session events") };
+            foreach (string record in records) lines.Add("    " + record);
+            lines.Add(DiagnosticLog.Format(clock(), "snapshot-end", ""));
+            Append(lines);
+        }
+
+        internal string[] Tail(int count)
+        {
+            var lines = new List<string>();
+            foreach (string path in new[] { previousPath, FilePath })
+            {
+                try { if (File.Exists(path)) lines.AddRange(File.ReadAllLines(path, Encoding.UTF8)); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+            return lines.Count <= count ? lines.ToArray() : lines.GetRange(lines.Count - count, count).ToArray();
+        }
+
+        private void Append(IList<string> lines)
+        {
+            try
+            {
+                Directory.CreateDirectory(folder);
+                string text = String.Join("\r\n", lines) + "\r\n";
+                var info = new FileInfo(FilePath);
+                if (info.Exists && info.Length + Encoding.UTF8.GetByteCount(text) > maximumBytes)
+                {
+                    File.Delete(previousPath);
+                    File.Move(FilePath, previousPath);
+                }
+                File.AppendAllText(FilePath, text, new UTF8Encoding(false));
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
         }
     }
 }

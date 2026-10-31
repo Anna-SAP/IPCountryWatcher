@@ -7,11 +7,18 @@ namespace IPCountryWatcher
     {
         internal static readonly TimeSpan GracePeriod = TimeSpan.FromMinutes(2);
         private Snapshot confirmed;
+        private int unconfirmedRounds;
         internal Snapshot Current { get; private set; }
+        // Set by the tray's fast link loop; Unknown and Healthy never change the badge.
+        internal LinkState Link { get; set; }
+        // One fully failed HTTPS round is a suspicion; the next consecutive one confirms it.
+        internal bool FailureConfirmed { get { return unconfirmedRounds >= 2; } }
 
         internal void Accept(Snapshot result)
         {
             Current = result;
+            unconfirmedRounds = result.Connectivity != null && result.Connectivity.Health == ConnectivityHealth.Unreachable ?
+                unconfirmedRounds + 1 : 0;
             if (result.HasCountry) confirmed = result;
             // A newly observed, unresolved IP must never inherit a previous country's flag.
             else if (result.HasIp) confirmed = null;
@@ -44,10 +51,13 @@ namespace IPCountryWatcher
 
         internal ConnectionBadge Badge(DateTime now)
         {
+            // The fast loop has already confirmed the outage over several rounds.
+            if (Link == LinkState.Down) return ConnectionBadge.Unconfirmed;
             ConnectivityHealth health = Health(now);
-            if (health == ConnectivityHealth.Unreachable) return ConnectionBadge.Unconfirmed;
+            if (health == ConnectivityHealth.Unreachable) return FailureConfirmed ? ConnectionBadge.Unconfirmed : ConnectionBadge.Limited;
             if (health == ConnectivityHealth.Limited) return ConnectionBadge.Limited;
             if (health == ConnectivityHealth.Checking || !IsIpFresh(now)) return ConnectionBadge.Pending;
+            if (Link == LinkState.Suspect || Link == LinkState.Degraded || Link == LinkState.Recovering) return ConnectionBadge.Limited;
             if (Current != null && Current.CountryIsStale) return ConnectionBadge.Limited;
             return ConnectionBadge.None;
         }

@@ -36,6 +36,9 @@ namespace IPCountryWatcher
             state.Accept(Measured(now, ConnectivityHealth.Limited));
             Check("A real Chinese IP with failed health targets cannot look fully healthy", state.Badge(now) == ConnectionBadge.Limited && state.IsIpFresh(now));
             state.Accept(Measured(now, ConnectivityHealth.Unreachable, false, false));
+            Check("One fully failed round warns while it is rechecked", state.Badge(now) == ConnectionBadge.Limited && !state.FailureConfirmed &&
+                state.Displayed(now).CountryCode == "CN" && !state.IsIpFresh(now));
+            state.Accept(Measured(now, ConnectivityHealth.Unreachable, false, false));
             Check("Failed probes visibly mark the old country as unconfirmed", state.Badge(now) == ConnectionBadge.Unconfirmed && state.Displayed(now).CountryCode == "CN" && !state.IsIpFresh(now));
             state.Accept(Measured(now, ConnectivityHealth.Reachable, true, false));
             Check("Country lookup failure does not erase successful connectivity", state.Displayed(now) == null && state.Health(now) == ConnectivityHealth.Reachable && state.Badge(now) == ConnectionBadge.None);
@@ -88,10 +91,11 @@ namespace IPCountryWatcher
             int calls = 0, seen = 0;
             var lookup = new DelegateLookup { Handler = token => {
                 int call = Interlocked.Increment(ref calls);
+                bool down = call == 3 || call == 4;
                 return Task.FromResult(Measured(DateTime.UtcNow, call == 2 ? ConnectivityHealth.Limited :
-                    call == 3 ? ConnectivityHealth.Unreachable : ConnectivityHealth.Reachable, call != 3, call != 3));
+                    down ? ConnectivityHealth.Unreachable : ConnectivityHealth.Reachable, !down, !down));
             } };
-            bool limited = false, failed = false, recovered = false;
+            bool limited = false, rechecking = false, failed = false, recovered = false;
             var context = new TrayContext(lookup, new Settings { PollSeconds = 60, NotifyOnChange = false }, true);
             var watch = Stopwatch.StartNew();
             using (var timer = new System.Windows.Forms.Timer { Interval = 25 })
@@ -101,15 +105,18 @@ namespace IPCountryWatcher
                     {
                         seen = calls;
                         if (seen == 2) limited = context.VisibleCountry == "CN" && context.VisibleBadge == ConnectionBadge.Limited && context.ConnectivityText.Contains("部分");
-                        if (seen == 3) failed = context.VisibleCountry == "CN" && context.VisibleBadge == ConnectionBadge.Unconfirmed && !context.CanCopyIp;
-                        if (seen == 4) recovered = context.VisibleBadge == ConnectionBadge.None && context.CanCopyIp;
-                        if (seen < 4) context.RequestRefresh();
+                        if (seen == 3) rechecking = context.VisibleCountry == "CN" && context.VisibleBadge == ConnectionBadge.Limited &&
+                            context.ConnectivityText.Contains("复核") && !context.CanCopyIp;
+                        if (seen == 4) failed = context.VisibleCountry == "CN" && context.VisibleBadge == ConnectionBadge.Unconfirmed && !context.CanCopyIp;
+                        if (seen == 5) recovered = context.VisibleBadge == ConnectionBadge.None && context.CanCopyIp;
+                        if (seen < 5) context.RequestRefresh();
                     }
-                    if (seen >= 4 || watch.ElapsedMilliseconds > 3000) { timer.Stop(); context.ExitThread(); }
+                    if (seen >= 5 || watch.ElapsedMilliseconds > 3000) { timer.Stop(); context.ExitThread(); }
                 };
                 timer.Start(); Application.Run(context);
             }
             context.Dispose();
+            Check("Real tray rechecks one fully failed round before marking it red", rechecking);
             Check("Real tray distinguishes partial availability, failure and recovery", limited && failed && recovered);
         }
 

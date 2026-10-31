@@ -24,6 +24,7 @@ namespace IPCountryWatcher
         private readonly ToolStripMenuItem countryItem = new ToolStripMenuItem("国家 / 地区：待识别");
         private readonly ToolStripMenuItem statusItem = new ToolStripMenuItem("正在启动");
         private readonly ToolStripMenuItem connectivityItem = new ToolStripMenuItem("连接：待确认");
+        private readonly ToolStripMenuItem linkItem = new ToolStripMenuItem("链路：检测尚未开始");
         private readonly ToolStripMenuItem probesItem = new ToolStripMenuItem("检测尚未完成");
         private readonly ToolStripMenuItem timeItem = new ToolStripMenuItem("尚未完成查询");
         private readonly ToolStripMenuItem copyItem = new ToolStripMenuItem("复制公网 IP");
@@ -36,6 +37,13 @@ namespace IPCountryWatcher
         private string iconCode = "#";
         private ConnectionBadge iconBadge;
         private readonly DiagnosticLog diagnostics;
+        private readonly IncidentJournal journal;
+        private const int JournalExportLines = 400;
+        private readonly LinkMonitor link;
+        private DateTime linkDueUtc;
+        private bool measuringLink;
+        private readonly IConnectionPool connections;
+        private HttpTransport processTransport;
         private readonly INetworkFingerprint fingerprint;
         private string lastFingerprint;
         private DateTime nextFingerprintUtc;
@@ -62,9 +70,14 @@ namespace IPCountryWatcher
         internal string ConnectivityText { get { return connectivityItem.Text; } }
         internal ContextMenuStrip Menu { get { return menu; } }
         internal bool RestartRequested { get; private set; }
+        internal LinkState VisibleLink { get { return displayState.Link; } }
+        internal string LinkText { get { return linkItem.Text; } }
 
+        // connections: the lookup's transport, so stale keep-alive sockets are closed whenever
+        // the route changes. Tests leave link and journal null unless they supply them.
         public TrayContext(ILookup lookup, Settings settings, bool testing, Func<DateTime> clock = null, IVoice voice = null,
-            INetworkFingerprint fingerprint = null)
+            INetworkFingerprint fingerprint = null, LinkMonitor link = null, IConnectionPool connections = null,
+            IncidentJournal journal = null)
         {
             this.lookup = lookup;
             this.settings = settings;
@@ -72,13 +85,19 @@ namespace IPCountryWatcher
             this.clock = clock ?? (() => DateTime.UtcNow);
             this.voice = voice;
             this.fingerprint = fingerprint ?? (testing ? null : new NetworkFingerprint());
+            this.link = link ?? (testing ? null : new LinkMonitor());
+            this.connections = connections;
             diagnostics = new DiagnosticLog(this.clock);
             diagnostics.Record("start", "IPCountryWatcher " + Application.ProductVersion);
+            this.journal = journal ?? (testing ? null : new IncidentJournal(Settings.Folder, this.clock));
+            if (this.journal != null) this.journal.Record("start", "IPCountryWatcher " + Application.ProductVersion);
             IntPtr handle = dispatcher.Handle;
             title.Enabled = ipItem.Enabled = countryItem.Enabled = statusItem.Enabled = timeItem.Enabled = connectivityItem.Enabled = probesItem.Enabled = false;
+            linkItem.Enabled = false;
+            linkItem.Visible = this.link != null;
             copyItem.Enabled = false;
             menu.Font = new Font("Microsoft YaHei UI", 9f);
-            menu.Items.AddRange(new ToolStripItem[] { title, new ToolStripSeparator(), ipItem, countryItem, connectivityItem, probesItem, statusItem, timeItem, new ToolStripSeparator() });
+            menu.Items.AddRange(new ToolStripItem[] { title, new ToolStripSeparator(), ipItem, countryItem, connectivityItem, linkItem, probesItem, statusItem, timeItem, new ToolStripSeparator() });
             menu.Items.Add("立即刷新", null, (s, e) => RequestRefresh());
             menu.Items.Add(copyItem);
             menu.Items.Add("导出连接诊断…", null, (s, e) => ExportDiagnostics());
@@ -113,7 +132,7 @@ namespace IPCountryWatcher
             menu.Items.Add(startupItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("关于", null, (s, e) => MessageBox.Show(
-                "IP 国旗监视器 " + Application.ProductVersion + "\n\n国旗表示出口国家；连接状态单独验证。\n黄色 !：待确认、部分可达或国家缓存待更新。\n红色 ×：本轮所测连接未确认。\n地球：国家未知，不等于整个系统断网。\n\nIP：icanhazip / Cloudflare trace / ifconfig.me\n连接检测：Cloudflare trace / ifconfig.me\n国家：ipwho.is / ipapi.co\n国旗：Flagpedia.net / flagcdn.com（已内嵌）\n\n这些服务会获知请求的公网 IP。\n检测结果仅代表本程序访问所测服务的路径，\n不能证明微信等其他应用或所有地址族正常。\n\n双击刷新；右键可导出本次运行的连接诊断。",
+                "IP 国旗监视器 " + Application.ProductVersion + "\n\n国旗表示出口国家；连接状态单独验证。\n黄色 !：待确认、复核中、部分可达、线路质量下降或国家缓存待更新。\n红色 ×：链路连续多轮无响应，或连续两轮所测连接未确认。\n地球：国家未知，不等于整个系统断网。\n\nIP：icanhazip / Cloudflare trace / ifconfig.me\n连接检测：Cloudflare trace / ifconfig.me\n链路：约每 2 秒一次 TCP 握手（icanhazip / 1.1.1.1 / 8.8.8.8，不发送数据）\n国家：ipwho.is / ipapi.co\n国旗：Flagpedia.net / flagcdn.com（已内嵌）\n\n这些服务会获知请求的公网 IP。\n检测结果仅代表本程序访问所测服务的路径，\n不能证明微信等其他应用或所有地址族正常。\n\n双击刷新；右键可导出连接诊断（含跨重启保留的事件日志）。",
                 "关于 IP 国旗监视器", MessageBoxButtons.OK, MessageBoxIcon.Information));
             menu.Items.Add("重启应用", null, (s, e) => Restart());
             menu.Items.Add("退出", null, (s, e) => ExitThread());
@@ -180,7 +199,8 @@ namespace IPCountryWatcher
         private void EnsureProcessMonitor()
         {
             if (processMonitor != null) return;
-            processMonitor = new ProcessMonitor(settings, new NativeProcessProbe(), new LookupService(new HttpTransport(), () => DateTime.UtcNow));
+            processTransport = new HttpTransport();
+            processMonitor = new ProcessMonitor(settings, new NativeProcessProbe(), new LookupService(processTransport, () => DateTime.UtcNow));
             processTimer.Start();
         }
 
@@ -258,6 +278,10 @@ namespace IPCountryWatcher
             failures = 0;
             if (processMonitor != null) processMonitor.Invalidate();
             if (activeRequest != null) activeRequest.Cancel();
+            // Pooled sockets may belong to the previous route, or be half-open after an outage.
+            if (connections != null) connections.Reset();
+            if (processTransport != null) processTransport.Reset();
+            if (link != null) link.Invalidate();
             var invalidatable = lookup as IInvalidatableLookup;
             if (invalidatable != null) invalidatable.Invalidate();
             displayState.Invalidate(clearPrevious);
@@ -275,12 +299,14 @@ namespace IPCountryWatcher
             {
                 lastTickUtc = now;
                 nextFingerprintUtc = DateTime.MinValue;
+                linkDueUtc = DateTime.MinValue;
                 diagnostics.Record("clock-change", "clock moved backwards; revalidating measurements");
                 RequestRefresh();
                 return;
             }
             lastTickUtc = now;
             CheckNetworkFingerprint();
+            PollLink();
             // Re-render freshness even during an in-flight request or long user polling interval.
             RenderState();
             AnnounceConnection(false);
@@ -331,6 +357,9 @@ namespace IPCountryWatcher
         {
             displayState.Accept(result);
             diagnostics.RecordResult(result);
+            // A fully failed HTTPS round asks the fast loop for an immediate second opinion.
+            if (link != null && result.Connectivity != null && result.Connectivity.Health == ConnectivityHealth.Unreachable)
+                linkDueUtc = DateTime.MinValue;
             status = result.Error ?? "监控中 · " + result.Source;
             RenderState();
             // Observe even while notifications are off, so re-enabling them cannot compare against an old result.
@@ -354,8 +383,14 @@ namespace IPCountryWatcher
         private void AnnounceConnection(bool changeSpoken)
         {
             DateTime now = clock();
+            // Speak what the badge shows: a confirmed link outage fails even while the last HTTPS result
+            // is still fresh, and one failed round awaiting its recheck is not yet a failure.
+            ConnectivityHealth health = displayState.Health(now);
+            if (displayState.Badge(now) == ConnectionBadge.Unconfirmed) health = ConnectivityHealth.Unreachable;
+            else if (health == ConnectivityHealth.Unreachable) health = ConnectivityHealth.Limited;
+            bool confirmed = displayState.IsIpFresh(now) && displayState.Link != LinkState.Down;
             // Observe even while announcements are off, so enabling them mid-outage cannot report a stale state.
-            ConnectionAlert alert = connectionAlerts.Observe(now, displayState.IsIpFresh(now), displayState.Health(now));
+            ConnectionAlert alert = connectionAlerts.Observe(now, confirmed, health);
             if (alert == ConnectionAlert.None) return;
             diagnostics.Record("connection-alert", alert.ToString());
             if (settings.VoiceMode == VoiceMode.Off || !settings.AnnounceConnection ||
@@ -369,11 +404,18 @@ namespace IPCountryWatcher
             Snapshot shown = displayState.Displayed(now);
             bool retained = shown != null && (shown != current || !displayState.IsIpFresh(now));
             ConnectivityHealth health = displayState.Health(now);
-            string healthText = health == ConnectivityHealth.Reachable ? "检测服务可达" :
+            ConnectionBadge badge = displayState.Badge(now);
+            LinkState linkState = displayState.Link;
+            string healthText = linkState == LinkState.Down ? (link != null && link.Stall >= LinkHealth.StallThreshold ? "链路无回包" : "链路中断") :
+                health == ConnectivityHealth.Reachable ? "检测服务可达" :
                 health == ConnectivityHealth.Limited ? "部分检测可达" :
-                health == ConnectivityHealth.Unreachable ? "所测连接未确认" : "连接待确认";
-            SetIcon(shown == null ? null : shown.CountryCode, displayState.Badge(now));
+                health == ConnectivityHealth.Unreachable ? (badge == ConnectionBadge.Unconfirmed ? "所测连接未确认" : "检测失败，正在复核") : "连接待确认";
+            // An early warning goes in front of the HTTPS result; an outage replaced it above.
+            string linkNote = linkState == LinkState.Suspect ? "链路复核中" : linkState == LinkState.Degraded ? "线路质量下降" :
+                linkState == LinkState.Recovering ? "链路恢复中" : null;
+            SetIcon(shown == null ? null : shown.CountryCode, badge);
             connectivityItem.Text = "连接：" + healthText + " · " + (settings.UseSystemProxy ? "系统代理模式" : "直连模式（含 VPN）");
+            linkItem.Text = LinkDescription(now);
             var connectivity = current == null ? null : current.Connectivity;
             probesItem.Text = connectivity == null ? "检测尚未完成；不代表其他应用的连接状态" :
                 (health == ConnectivityHealth.Checking ? "上次探测：" : "探测时间：") + connectivity.CheckedUtc.ToLocalTime().ToString("HH:mm:ss") + " · " + ProbeSummary(connectivity);
@@ -390,8 +432,73 @@ namespace IPCountryWatcher
                 shown != null ? (shown.CountryIsStale ? "国家缓存待更新 · " : "") + shown.CountryCode + " · " + shown.Ip :
                 current != null && current.HasIp ? "国家待识别 · " + current.Ip : "网络未确认 · 等待重试";
             if (!retained) tooltip = healthText + " · " + tooltip;
+            if (linkNote != null) tooltip = linkNote + " · " + tooltip;
             tray.Text = tooltip.Length > 63 ? tooltip.Substring(0, 63) : tooltip;
         }
+
+        private string LinkDescription(DateTime now)
+        {
+            if (link == null) return "链路：未启用";
+            LinkHealth quality = link.Health;
+            string numbers = quality.MedianRttMs < 0 ? "" : " · 握手 " + quality.MedianRttMs + " ms" +
+                (quality.BaselineMs > 0 ? "（基线 " + (long)quality.BaselineMs + " ms）" : "") + " · 丢失 " + quality.LossPercent + "%";
+            switch (link.State)
+            {
+                case LinkState.Healthy: return "链路：正常" + numbers;
+                case LinkState.Degraded: return "链路：质量下降" + numbers;
+                case LinkState.Suspect: return "链路：握手失败，正在复核…";
+                case LinkState.Down:
+                    long seconds = Math.Max(0, (long)(now - quality.DownSinceUtc).TotalSeconds);
+                    return "链路：中断 " + seconds + " 秒" + (link.Stall >= LinkHealth.StallThreshold ? " · 只发出、无回包" : "");
+                case LinkState.Recovering: return "链路：恢复中，持续成功 6 秒后确认";
+                default: return link.Proxied ? "链路：系统代理生效，不做直连握手" : "链路：尚无目标应答，暂不判断";
+            }
+        }
+
+        private async void PollLink()
+        {
+            if (link == null || measuringLink || clock() < linkDueUtc) return;
+            measuringLink = true;
+            try
+            {
+                LinkReading reading = await link.MeasureAsync(settings.UseSystemProxy, clock());
+                if (closing) return;
+                LinkState previous = link.State;
+                LinkState state = link.Observe(reading, clock());
+                displayState.Link = state;
+                if (state != previous) LinkChanged(previous, state);
+                RenderState();
+            }
+            catch (Exception) { if (!closing) diagnostics.Record("link-read", "measurement unavailable"); }
+            finally
+            {
+                measuringLink = false;
+                linkDueUtc = clock().Add(link.Interval);
+            }
+        }
+
+        private void LinkChanged(LinkState previous, LinkState state)
+        {
+            string detail = previous + "->" + state + "; " + link.Summary();
+            diagnostics.Record("link", detail);
+            // Single unconfirmed misses (Healthy <-> Suspect) stay in memory; outages, degradation
+            // and route changes are kept across restarts.
+            if (journal != null && (IsNotable(previous) || IsNotable(state)))
+            {
+                journal.Record("link", detail);
+                if (state == LinkState.Down) journal.RecordSnapshot(diagnostics.Records());
+            }
+            if (previous == LinkState.Recovering && state == LinkState.Healthy)
+            {
+                string outage = "down for " + Math.Max(0, (long)(clock() - link.Health.DownSinceUtc).TotalSeconds).ToString(System.Globalization.CultureInfo.InvariantCulture) + "s, recovered";
+                diagnostics.Record("incident", outage);
+                if (journal != null) journal.Record("incident", outage);
+            }
+            // Connections opened before the outage may be half-open: confirm the egress on fresh ones.
+            if (previous == LinkState.Down && state == LinkState.Recovering) RequestRefresh();
+        }
+
+        private static bool IsNotable(LinkState state) { return state != LinkState.Healthy && state != LinkState.Suspect; }
 
         private void CopyIp()
         {
@@ -443,7 +550,11 @@ namespace IPCountryWatcher
                 FileName = "IPCountryWatcher-diagnostics-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".txt" })
             {
                 if (dialog.ShowDialog() != DialogResult.OK) return;
-                try { File.WriteAllText(dialog.FileName, diagnostics.ExportText(), new System.Text.UTF8Encoding(true)); }
+                string text = diagnostics.ExportText();
+                if (journal != null)
+                    text += "\r\nPersistent incident journal (last " + JournalExportLines + " lines; kept across restarts):\r\n" +
+                        String.Join("\r\n", journal.Tail(JournalExportLines)) + "\r\n";
+                try { File.WriteAllText(dialog.FileName, text, new System.Text.UTF8Encoding(true)); }
                 catch (Exception ex) { ShowError("无法导出诊断：" + ex.Message); }
             }
         }
@@ -494,6 +605,7 @@ namespace IPCountryWatcher
             timer.Stop();
             processTimer.Stop(); processTimer.Dispose();
             if (processMonitor != null) processMonitor.Dispose();
+            if (processTransport != null) processTransport.Dispose();
             if (processForm != null) processForm.Dispose();
             NetworkChange.NetworkAddressChanged -= NetworkChanged;
             NetworkChange.NetworkAvailabilityChanged -= AvailabilityChanged;
