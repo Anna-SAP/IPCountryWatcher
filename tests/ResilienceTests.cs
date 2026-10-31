@@ -123,7 +123,8 @@ namespace IPCountryWatcher
                         refreshed = true; context.RequestRefresh();
                         Check("Real tray keeps flag during refresh and disables stale-IP copying", context.VisibleCountry == "SG" && context.Current == null && !context.CanCopyIp && context.TooltipText.Contains("待确认"));
                     }
-                    if (context.Current != null && !context.Current.HasIp)
+                    // Skip the brief "正在检查…" render before the retry's result is applied.
+                    if (context.Current != null && !context.Current.HasIp && !context.StatusText.StartsWith("正在检查"))
                         retainedFailure = context.VisibleCountry == "SG" && context.StatusText.Contains("simulated timeout") && context.TooltipText.Contains("上次") && !context.CanCopyIp;
                     recovered = calls >= 3 && context.Current != null && context.Current.HasCountry;
                     if (recovered)

@@ -48,37 +48,127 @@ namespace IPCountryWatcher
         { StatusCode = statusCode; }
     }
 
-    internal sealed class HttpTransport : ITransport
+    internal interface IConnectionPool
     {
+        // Closes kept-alive connections; the next request opens a fresh one on the current route.
+        void Reset();
+    }
+
+    internal sealed class HttpTransport : ITransport, IConnectionPool, IDisposable
+    {
+        // A reused keep-alive connection costs one round trip instead of DNS+TCP+TLS; on a
+        // lossy 350 ms tunnel the handshake is what times out. Reset on network/proxy changes
+        // and a short client lifetime still pick up a new route, Windows proxy or DNS answer.
+        internal static readonly TimeSpan ClientLifetime = TimeSpan.FromMinutes(2);
+        // Callers enforce their own adaptive budgets; this only bounds a request without one.
+        internal static readonly TimeSpan RequestLimit = TimeSpan.FromSeconds(8);
+        private readonly object gate = new object();
+        private readonly HttpClient[] clients = new HttpClient[2];
+        private readonly DateTime[] created = new DateTime[2];
+        private bool disposed;
+
         public async Task<string> GetAsync(string url, bool systemProxy, CancellationToken token)
         {
-            // Recreate the handler so a changed Windows proxy is picked up on the next poll.
-            using (var handler = new HttpClientHandler())
+            HttpClient client = Acquire(systemProxy);
+            using (var response = await client.GetAsync(url, token).ConfigureAwait(false))
             {
-                handler.UseProxy = systemProxy;
-                if (systemProxy) handler.Proxy = WebRequest.GetSystemWebProxy();
-                handler.AllowAutoRedirect = false;
-                using (var client = new HttpClient(handler))
+                if ((int)response.StatusCode == 429)
                 {
-                    client.Timeout = TimeSpan.FromSeconds(4);
-                    client.MaxResponseContentBufferSize = 16384;
-                    client.DefaultRequestHeaders.UserAgent.ParseAdd("IPCountryWatcher/1.0");
-                    client.DefaultRequestHeaders.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true, NoStore = true };
-                    using (var response = await client.GetAsync(url, token).ConfigureAwait(false))
-                    {
-                        if ((int)response.StatusCode == 429)
-                        {
-                            var retry = response.Headers.RetryAfter;
-                            var delay = retry != null && retry.Delta.HasValue ? retry.Delta.Value :
-                                retry != null && retry.Date.HasValue ? retry.Date.Value.UtcDateTime - DateTime.UtcNow : TimeSpan.FromHours(24);
-                            if (delay < TimeSpan.FromMinutes(1)) delay = TimeSpan.FromMinutes(1);
-                            throw new RateLimitException(delay);
-                        }
-                        if (!response.IsSuccessStatusCode) throw new HttpStatusException((int)response.StatusCode);
-                        return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                    }
+                    var retry = response.Headers.RetryAfter;
+                    var delay = retry != null && retry.Delta.HasValue ? retry.Delta.Value :
+                        retry != null && retry.Date.HasValue ? retry.Date.Value.UtcDateTime - DateTime.UtcNow : TimeSpan.FromHours(24);
+                    if (delay < TimeSpan.FromMinutes(1)) delay = TimeSpan.FromMinutes(1);
+                    throw new RateLimitException(delay);
                 }
+                if (!response.IsSuccessStatusCode) throw new HttpStatusException((int)response.StatusCode);
+                return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
             }
+        }
+
+        // Requests still running on these connections were started for the previous route;
+        // aborting them is intended.
+        public void Reset() { Retire(false); }
+
+        public void Dispose() { Retire(true); }
+
+        private HttpClient Acquire(bool systemProxy)
+        {
+            int slot = systemProxy ? 1 : 0;
+            HttpClient aged = null, client;
+            lock (gate)
+            {
+                if (disposed) throw new ObjectDisposedException("HttpTransport");
+                DateTime now = DateTime.UtcNow;
+                if (clients[slot] != null && (now < created[slot] || now - created[slot] >= ClientLifetime))
+                { aged = clients[slot]; clients[slot] = null; }
+                if (clients[slot] == null) { clients[slot] = Create(systemProxy); created[slot] = now; }
+                client = clients[slot];
+            }
+            // An aged client may still carry a request; RequestLimit bounds how long.
+            if (aged != null)
+                ConnectivityTasks.ObserveFault(Task.Delay(RequestLimit + RequestLimit).ContinueWith(t => aged.Dispose(), TaskScheduler.Default));
+            return client;
+        }
+
+        private void Retire(bool final)
+        {
+            HttpClient[] old;
+            lock (gate)
+            {
+                if (final) disposed = true;
+                old = (HttpClient[])clients.Clone();
+                Array.Clear(clients, 0, clients.Length);
+            }
+            foreach (HttpClient client in old) if (client != null) client.Dispose();
+        }
+
+        private static HttpClient Create(bool systemProxy)
+        {
+            var handler = new HttpClientHandler { UseProxy = systemProxy, AllowAutoRedirect = false };
+            if (systemProxy) handler.Proxy = WebRequest.GetSystemWebProxy();
+            // The client disposes the handler, which closes its own connection group.
+            var client = new HttpClient(handler);
+            client.Timeout = RequestLimit;
+            client.MaxResponseContentBufferSize = 16384;
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("IPCountryWatcher/1.0");
+            client.DefaultRequestHeaders.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue { NoCache = true, NoStore = true };
+            return client;
+        }
+    }
+
+    // Recent successful request durations on the current path. A budget derived from them
+    // keeps one lost packet on a slow tunnel from turning a slow success into a timeout,
+    // while the floor keeps fast networks at the original deadline.
+    internal sealed class LatencyTracker
+    {
+        internal const int Capacity = 20;
+        private readonly object gate = new object();
+        private readonly Queue<long> samples = new Queue<long>();
+
+        internal void Record(long milliseconds)
+        {
+            lock (gate)
+            {
+                if (samples.Count >= Capacity) samples.Dequeue();
+                samples.Enqueue(Math.Max(0, milliseconds));
+            }
+        }
+
+        // -1 until three samples exist: one fast or slow request is not a property of the path.
+        internal long Median()
+        {
+            long[] copy;
+            lock (gate) copy = samples.ToArray();
+            if (copy.Length < 3) return -1;
+            Array.Sort(copy);
+            return copy[copy.Length / 2];
+        }
+
+        // Room for four typical requests, never below the original deadline nor above twice it.
+        internal int Budget(int minimum)
+        {
+            long median = Median();
+            return median < 0 ? minimum : (int)Math.Max(minimum, Math.Min(2L * minimum, 4 * median));
         }
     }
 
@@ -152,7 +242,9 @@ namespace IPCountryWatcher
         private readonly Dictionary<string, Snapshot> cache = new Dictionary<string, Snapshot>();
         private readonly Dictionary<string, DateTime> endpointCooldown = new Dictionary<string, DateTime>();
         private readonly object cooldownLock = new object();
+        private readonly LatencyTracker latency = new LatencyTracker();
         internal const int HedgeMilliseconds = 200;
+        internal const int MaximumHedgeMilliseconds = 1500;
         internal const int StageTimeoutMilliseconds = 4000;
         internal static readonly TimeSpan CountryCacheLifetime = TimeSpan.FromHours(24);
         internal static readonly TimeSpan CountryCacheFallbackLifetime = TimeSpan.FromDays(7);
@@ -223,16 +315,25 @@ namespace IPCountryWatcher
             return country;
         }
 
-        // Start a backup after 200 ms, or immediately on failure. Return the first valid
+        // Hedge only once the primary is slower than this path usually is: a fixed 200 ms
+        // duplicates every request on a tunnel whose round trip alone is 350 ms.
+        internal int HedgeDelay()
+        {
+            long median = latency.Median();
+            return median < 0 ? HedgeMilliseconds : (int)Math.Max(HedgeMilliseconds, Math.Min(MaximumHedgeMilliseconds, median * 3 / 2));
+        }
+
+        // Start a backup after the hedge delay, or immediately on failure. Return the first valid
         // response without waiting for losing requests or a transport that ignores cancellation.
         private async Task<Snapshot> RaceAsync(string[] urls, string expectedIp, bool proxy, CancellationToken token)
         {
             using (var race = CancellationTokenSource.CreateLinkedTokenSource(token))
             {
-                race.CancelAfter(StageTimeoutMilliseconds);
+                race.CancelAfter(latency.Budget(StageTimeoutMilliseconds));
+                int hedgeDelay = HedgeDelay();
                 var pending = new List<Task<Snapshot>>();
                 Task canceled = Task.Delay(Timeout.Infinite, race.Token);
-                Task hedge = Task.Delay(HedgeMilliseconds, race.Token);
+                Task hedge = Task.Delay(hedgeDelay, race.Token);
                 int next = 0;
                 try
                 {
@@ -253,7 +354,7 @@ namespace IPCountryWatcher
                             var task = Task.Run(() => AttemptAsync(url, expectedIp, proxy, attemptToken));
                             ObserveFault(task);
                             pending.Add(task);
-                            hedge = Task.Delay(HedgeMilliseconds, race.Token);
+                            hedge = Task.Delay(hedgeDelay, race.Token);
                         }
                         if (pending.Count == 0 && next == urls.Length) return null;
                         var waits = new List<Task>();
@@ -284,13 +385,16 @@ namespace IPCountryWatcher
 
         private async Task<Snapshot> AttemptAsync(string url, string expectedIp, bool proxy, CancellationToken token)
         {
+            var watch = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 string text = await transport.GetAsync(url, proxy, token).ConfigureAwait(false);
                 token.ThrowIfCancellationRequested();
-                if (expectedIp == null)
-                    return new Snapshot { Ip = Validation.ResponseIp(text), Source = SourceName(url) };
-                return Validation.CountryJson(text, expectedIp, new Uri(url).Host == "ipapi.co");
+                Snapshot result = expectedIp == null ? new Snapshot { Ip = Validation.ResponseIp(text), Source = SourceName(url) } :
+                    Validation.CountryJson(text, expectedIp, new Uri(url).Host == "ipapi.co");
+                // Losing and invalid responses never reach here, so only real path latency is learned.
+                latency.Record(watch.ElapsedMilliseconds);
+                return result;
             }
             catch (RateLimitException ex)
             {
